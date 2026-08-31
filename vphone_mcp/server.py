@@ -347,21 +347,45 @@ def _running_launch_pids() -> list[int]:
 
 
 def _guest_ip() -> str:
-    """Best-effort guest IP: launch-log serial scan + arp on the NAT bridge.
+    """Best-effort guest IP, verified by liveness where possible.
 
-    vm launch streams the guest serial console into its log file, but iOS
-    stays quiet about networking there; the reliable signal is the arp table
-    on the Virtualization.framework NAT bridge (bridge100, 192.168.x.y).
-    Returns a comma-joined list of candidates or "(none found)".
+    Each boot gets a fresh DHCP lease (the manifest's MAC address is
+    empty, so the guest's MAC changes per launch) — historical logs
+    lie. The probe prefers live signals and only reports an address
+    if the guest's dropbear answers on port 22222.
     """
     import re
+    import socket as socket_mod
 
-    log_dir = Path.home() / ".vphone" / "vphone-mcp" / "logs"
     pat = re.compile(
         r"\b(?:192\.168|10\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01]))\.\d{1,3}\.\d{1,3}\b"
     )
-    found: list[str] = []
+    candidates: list[str] = []
+
+    def _add(ip: str) -> None:
+        if ip not in candidates:
+            candidates.append(ip)
+
+    # Live signal first: the NAT bridge's arp table (bridge100, bridge102, ...).
     try:
+        out = subprocess.run(
+            ["arp", "-an"], capture_output=True, text=True, timeout=5
+        ).stdout
+        for line in out.splitlines():
+            if " bridge" not in line:
+                continue
+            for m in pat.finditer(line):
+                ip = m.group()
+                if ip.endswith(".1"):
+                    continue
+                _add(ip)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+    # Historical fallback: newest launch logs (the guest serial prints
+    # its DHCP address at boot). Stale by nature — candidates only.
+    try:
+        log_dir = Path.home() / ".vphone" / "vphone-mcp" / "logs"
         logs = sorted(
             log_dir.glob("*_launch_*.log"),
             key=lambda p: p.stat().st_mtime,
@@ -373,27 +397,24 @@ def _guest_ip() -> str:
             except OSError:
                 continue
             for m in pat.finditer(text):
-                if m.group() not in found:
-                    found.append(m.group())
+                _add(m.group())
     except OSError:
         pass
-    # arp fallback: the NAT bridge's table lists the guest next to the
-    # host-side .1 (filtered out).
-    try:
-        out = subprocess.run(
-            ["arp", "-an"], capture_output=True, text=True, timeout=5
-        ).stdout
-        for line in out.splitlines():
-            if " bridge" not in line:
-                continue
-            for m in pat.finditer(line):
-                ip = m.group()
-                if ip.endswith(".1") or ip in found:
-                    continue
-                found.append(ip)
-    except (OSError, subprocess.TimeoutExpired):
-        pass
-    return ", ".join(found) or "(none found)"
+
+    # Liveness gate: the guest's dropbear listens on 22222. Only report
+    # addresses that answer — everything else is a stale lease.
+    live: list[str] = []
+    for ip in candidates:
+        try:
+            with socket_mod.create_connection((ip, 22222), timeout=1.5):
+                live.append(ip)
+        except OSError:
+            continue
+    if live:
+        return ", ".join(live)
+    if candidates:
+        return ", ".join(candidates) + " (unverified — no candidate answered on :22222)"
+    return "(none found)"
 
 
 @mcp.tool()
