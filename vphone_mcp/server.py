@@ -346,27 +346,32 @@ def _running_launch_pids() -> list[int]:
     return [int(p) for p in proc.stdout.split() if p.strip().isdigit()]
 
 
-def _guest_ip() -> str:
-    """Best-effort guest IP, verified by liveness where possible.
+def _guest_network() -> str:
+    """Probe the NAT bridge + launch logs for guest IPs, liveness-gated.
 
     Each boot gets a fresh DHCP lease (the manifest's MAC address is
-    empty, so the guest's MAC changes per launch) — historical logs
-    lie. The probe prefers live signals and only reports an address
-    if the guest's dropbear answers on port 22222.
+    empty), so identity cannot come from the IP itself: attribution is
+    by dropbear host-key fingerprint (stable per VM, generated at its
+    first boot). Live addresses answer a keyscan on port 22222;
+    everything else is a stale lease.
     """
+    import hashlib
     import re
     import socket as socket_mod
 
     pat = re.compile(
         r"\b(?:192\.168|10\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01]))\.\d{1,3}\.\d{1,3}\b"
     )
-    candidates: list[str] = []
+    cand: dict[str, dict] = {}
 
-    def _add(ip: str) -> None:
-        if ip not in candidates:
-            candidates.append(ip)
+    def _add(ip: str, source: str, mac: str = "") -> None:
+        c = cand.setdefault(ip, {"mac": mac, "sources": set()})
+        c["sources"].add(source)
+        if mac and not c["mac"]:
+            c["mac"] = mac
 
-    # Live signal first: the NAT bridge's arp table (bridge100, bridge102, ...).
+    # 1) Live signal first: the NAT bridge's arp table, with MACs
+    #    (bridge100, bridge102, ... — a new instance per launch).
     try:
         out = subprocess.run(
             ["arp", "-an"], capture_output=True, text=True, timeout=5
@@ -374,47 +379,76 @@ def _guest_ip() -> str:
         for line in out.splitlines():
             if " bridge" not in line:
                 continue
-            for m in pat.finditer(line):
-                ip = m.group()
-                if ip.endswith(".1"):
-                    continue
-                _add(ip)
+            ipm = pat.search(line)
+            if not ipm or ipm.group().endswith(".1") or ipm.group().endswith(".255"):
+                continue
+            macm = re.search(r"([0-9a-f]{1,2}[:-]){5}[0-9a-f]{1,2}", line, re.I)
+            mac = macm.group(0) if macm else ""
+            # Skip broadcast/multicast MACs (they are not hosts).
+            if mac.lower().startswith("ff:") or mac.lower().startswith("01:00:5e"):
+                continue
+            _add(ipm.group(), "arp", mac)
     except (OSError, subprocess.TimeoutExpired):
         pass
 
-    # Historical fallback: newest launch logs (the guest serial prints
-    # its DHCP address at boot). Stale by nature — candidates only.
+    # 2) Historical candidates: per-VM newest launch logs (the serial
+    #    prints the DHCP address sometimes; the log stem is the VM name).
     try:
         log_dir = Path.home() / ".vphone" / "vphone-mcp" / "logs"
-        logs = sorted(
-            log_dir.glob("*_launch_*.log"),
-            key=lambda p: p.stat().st_mtime,
-            reverse=True,
-        )[:3]
-        for logf in logs:
+        by_stem: dict[str, list[Path]] = {}
+        for p in log_dir.glob("*_launch_*.log"):
+            stem = p.name.split("_launch_")[0]
+            by_stem.setdefault(stem, []).append(p)
+        for stem, logs in by_stem.items():
+            newest = max(logs, key=lambda p: p.stat().st_mtime)
             try:
-                text = logf.read_text(errors="ignore")
+                text = newest.read_text(errors="ignore")
             except OSError:
                 continue
             for m in pat.finditer(text):
-                _add(m.group())
+                _add(m.group(), f"log:{stem}")
     except OSError:
         pass
 
-    # Liveness gate: the guest's dropbear listens on 22222. Only report
-    # addresses that answer — everything else is a stale lease.
+    # 3) Identity + liveness: dropbear answers on 22222; its host key
+    #    fingerprint is the stable per-VM identifier.
     live: list[str] = []
-    for ip in candidates:
+    stale: list[str] = []
+    for ip in sorted(cand):
+        fp = ""
         try:
-            with socket_mod.create_connection((ip, 22222), timeout=1.5):
-                live.append(ip)
-        except OSError:
-            continue
+            res = subprocess.run(
+                ["ssh-keyscan", "-p", "22222", "-T", "2", ip],
+                capture_output=True,
+                text=True,
+                timeout=6,
+            )
+            for line in res.stdout.splitlines():
+                if not line.startswith("#") and "ssh-" in line:
+                    fp = hashlib.sha256(line.strip().split()[-1].encode()).hexdigest()[:16]
+                    break
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        cand[ip]["fp"] = fp
+        (live if fp else stale).append(ip)
+
+    lines: list[str] = []
     if live:
-        return ", ".join(live)
-    if candidates:
-        return ", ".join(candidates) + " (unverified — no candidate answered on :22222)"
-    return "(none found)"
+        lines.append("  live (dropbear answers on :22222):")
+        for ip in live:
+            info = cand[ip]
+            src = ",".join(sorted(info["sources"]))
+            lines.append(
+                f"    {ip}  mac={info['mac'] or '?'}  ssh={info['fp']}  [{src}]"
+            )
+    if stale:
+        lines.append("  other candidates (no listener — stale leases):")
+        for ip in stale:
+            src = ",".join(sorted(cand[ip]["sources"]))
+            lines.append(f"    {ip}  [{src}]")
+    if not cand:
+        lines.append("  (none found)")
+    return "\n".join(lines)
 
 
 @mcp.tool()
@@ -464,8 +498,9 @@ def vphone_status() -> str:
     except RuntimeError as exc:
         lines.append(f"`vm list --json`: failed — {exc}")
 
-    # guest IP (parsed from launch-log serial output)
-    lines.append(f"guest IP (from launch logs): {_guest_ip()}")
+    # guest network (arp + per-VM logs, liveness-gated, fingerprint-identified)
+    lines.append("guest network:")
+    lines.append(_guest_network())
 
     # running launch processes
     try:
