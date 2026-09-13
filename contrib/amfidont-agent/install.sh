@@ -48,7 +48,10 @@ One-time install (run these):
 
   cp "$AGENT_DIR/com.vphone.amfidont.plist" "$HOME_DIR/Library/LaunchAgents/"
   sudo cp "$AGENT_DIR/vphone-amfidont.sudoers" /etc/sudoers.d/vphone-amfidont
+  sudo chown root:wheel /etc/sudoers.d/vphone-amfidont
+  sudo chmod 0440 /etc/sudoers.d/vphone-amfidont
   sudo visudo -c
+  launchctl bootout gui/$(id -u)/com.vphone.amfidont 2>/dev/null || true
   launchctl bootstrap gui/$(id -u) "$HOME_DIR/Library/LaunchAgents/com.vphone.amfidont.plist"
 
 Verify:
