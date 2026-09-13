@@ -14,31 +14,38 @@ regardless of uid. The chain that works is exactly the one a terminal uses:
 login session → sudo → python -m amfidont --spoof-apple --path <app>
 ```
 
-These templates reproduce that chain at login: a **user LaunchAgent** runs
+These files reproduce that chain at login: a **user LaunchAgent** runs
 `/usr/bin/sudo -n` (non-interactive), backed by a NOPASSWD sudoers entry
 scoped to the exact interpreter + module invocation.
 
 ## Install
 
+One command does everything — generate machine-specific files, install the
+sudoers entry (validated with `visudo` *before* installing so a broken file
+can't brick sudo), install the LaunchAgent, reload it, and verify:
+
 ```bash
 ./install.sh
 ```
 
-`install.sh` resolves your machine's interpreter and user, generates the
-real plist + sudoers under `~/.vphone/amfidont-agent/`, validates them,
-and prints the three commands you run once (two need sudo):
-
-1. `sudo cp …/com.vphone.amfidont.plist ~/Library/LaunchAgents/`
-2. `sudo cp …/vphone-amfidont.sudoers /etc/sudoers.d/ && sudo visudo -c`
-3. `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.vphone.amfidont.plist`
+You'll be asked for your password once (sudoers step). The script is
+idempotent — safe to re-run after upgrades or when paths change.
 
 ## Verify
 
-```
+```bash
 launchctl print gui/$(id -u)/com.vphone.amfidont | grep state   # state = running
-tail -2 ~/Library/Logs/vphone-amfidont.log                       # "Attached to amfid"
+tail -3 ~/Library/Logs/vphone-amfidont.log                       # "Attached to amfid"
 ```
 
-The daemon survives reboots (RunAtLoad + KeepAlive). Only one amfidont may
-be attached to amfid at a time — stop any foreground `vphone-amfidont`
-before bootstrapping the agent.
+The agent survives reboots (RunAtLoad + KeepAlive). Only one amfidont may
+be attached to amfid at a time — `install.sh` boots out any stale
+same-label job before loading.
+
+## Uninstall
+
+```bash
+launchctl bootout gui/$(id -u)/com.vphone.amfidont
+sudo rm /etc/sudoers.d/vphone-amfidont
+rm ~/Library/LaunchAgents/com.vphone.amfidont.plist
+```
