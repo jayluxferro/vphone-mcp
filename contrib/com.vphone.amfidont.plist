@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.vphone.amfidont</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.9/Resources/Python.app/Contents/MacOS/Python</string>
+        <string>-m</string>
+        <string>amfidont</string>
+        <string>--spoof-apple</string>
+        <string>--path</string>
+        <string>/Applications/vphone-cli.app</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>/Users/jay</string>
+        <key>PYTHONPATH</key>
+        <string>/Users/jay/Library/Python/3.9/lib/python/site-packages</string>
+        <key>PATH</key>
+        <string>/Applications/Xcode.app/Contents/Developer/usr/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/var/log/vphone-amfidont.log</string>
+    <key>StandardErrorPath</key>
+    <string>/var/log/vphone-amfidont.log</string>
+</dict>
+</plist>
