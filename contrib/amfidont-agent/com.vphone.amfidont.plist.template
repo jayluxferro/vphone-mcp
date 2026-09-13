@@ -11,6 +11,7 @@
         <string>/usr/bin/sudo</string>
         <string>-n</string>
         <string>{{PYTHON_BIN}}</string>
+        <string>-u</string>
         <string>-m</string>
         <string>amfidont</string>
         <string>--spoof-apple</string>
