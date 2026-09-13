@@ -333,10 +333,19 @@ def swipe(
 # ---------------------------------------------------------------------------
 
 def _running_launch_pids() -> list[int]:
-    """PIDs of running vphone-cli processes (vm launch / boot are blocking)."""
+    """PIDs of running vphone-cli processes (vm launch / boot are blocking).
+
+    Matches the binary paths only — a bare 'vphone-cli' pattern would also
+    match the amfidont daemon, whose --path argument contains the app name.
+    """
     try:
         proc = subprocess.run(
-            ["pgrep", "-f", "vphone-cli"],
+            [
+                "pgrep",
+                "-f",
+                r"vphone-cli\.app/Contents/MacOS/vphone-cli|"
+                r"/opt/homebrew/bin/vphone-cli|/usr/local/bin/vphone-cli",
+            ],
             capture_output=True,
             text=True,
             timeout=5,
@@ -508,7 +517,7 @@ def vphone_status() -> str:
     except Exception:
         pids = []
     lines.append(
-        "running vphone-cli processes (pgrep -f vphone-cli): "
+        "running vphone-cli processes (binary paths only): "
         + (", ".join(str(p) for p in pids) if pids else "none")
     )
     return "\n".join(lines)
