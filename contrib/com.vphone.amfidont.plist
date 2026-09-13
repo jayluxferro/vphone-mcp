@@ -10,11 +10,14 @@
         <string>-m</string>
         <string>amfidont</string>
         <string>--spoof-apple</string>
+        <string>--verbose</string>
         <string>--path</string>
         <string>/Applications/vphone-cli.app</string>
     </array>
     <key>EnvironmentVariables</key>
     <dict>
+        <key>DEVELOPER_DIR</key>
+        <string>/Applications/Xcode.app/Contents/Developer</string>
         <key>HOME</key>
         <string>/Users/jay</string>
         <key>PYTHONPATH</key>
