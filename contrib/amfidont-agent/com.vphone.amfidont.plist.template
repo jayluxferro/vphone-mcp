@@ -1,5 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Template. install.sh substitutes {{...}} placeholders with the
+     installing machine's values; do not commit real paths. -->
 <plist version="1.0">
 <dict>
     <key>Label</key>
@@ -8,30 +10,30 @@
     <array>
         <string>/usr/bin/sudo</string>
         <string>-n</string>
-        <string>/Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.9/Resources/Python.app/Contents/MacOS/Python</string>
+        <string>{{PYTHON_BIN}}</string>
         <string>-m</string>
         <string>amfidont</string>
         <string>--spoof-apple</string>
         <string>--verbose</string>
         <string>--path</string>
-        <string>/Applications/vphone-cli.app</string>
+        <string>{{APP_PATH}}</string>
     </array>
     <key>EnvironmentVariables</key>
     <dict>
         <key>DEVELOPER_DIR</key>
-        <string>/Applications/Xcode.app/Contents/Developer</string>
+        <string>{{DEVELOPER_DIR}}</string>
         <key>PYTHONPATH</key>
-        <string>/Users/jay/Library/Python/3.9/lib/python/site-packages</string>
+        <string>{{SITE_PACKAGES}}</string>
         <key>PATH</key>
-        <string>/Applications/Xcode.app/Contents/Developer/usr/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <string>{{DEVELOPER_DIR}}/usr/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     </dict>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>/Users/jay/Library/Logs/vphone-amfidont.log</string>
+    <string>{{LOG_PATH}}</string>
     <key>StandardErrorPath</key>
-    <string>/Users/jay/Library/Logs/vphone-amfidont.log</string>
+    <string>{{LOG_PATH}}</string>
 </dict>
 </plist>

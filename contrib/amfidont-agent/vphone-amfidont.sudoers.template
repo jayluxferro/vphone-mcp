@@ -1,0 +1,4 @@
+# Template. install.sh substitutes {{...}} placeholders.
+# Allows the login LaunchAgent to run the amfidont daemon as root
+# non-interactively (sudo -n). Scoped to the exact invocation.
+{{USER}} ALL=(root) NOPASSWD: {{PYTHON_BIN}} -m amfidont *
