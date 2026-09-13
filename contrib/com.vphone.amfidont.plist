@@ -4,12 +4,10 @@
 <dict>
     <key>Label</key>
     <string>com.vphone.amfidont</string>
-    <key>UserName</key>
-    <string>root</string>
-    <key>LimitLoadToSessionType</key>
-    <string>Aqua</string>
     <key>ProgramArguments</key>
     <array>
+        <string>/usr/bin/sudo</string>
+        <string>-n</string>
         <string>/Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.9/Resources/Python.app/Contents/MacOS/Python</string>
         <string>-m</string>
         <string>amfidont</string>
@@ -22,8 +20,6 @@
     <dict>
         <key>DEVELOPER_DIR</key>
         <string>/Applications/Xcode.app/Contents/Developer</string>
-        <key>HOME</key>
-        <string>/Users/jay</string>
         <key>PYTHONPATH</key>
         <string>/Users/jay/Library/Python/3.9/lib/python/site-packages</string>
         <key>PATH</key>
@@ -34,8 +30,8 @@
     <key>KeepAlive</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>/var/log/vphone-amfidont.log</string>
+    <string>/Users/jay/Library/Logs/vphone-amfidont.log</string>
     <key>StandardErrorPath</key>
-    <string>/var/log/vphone-amfidont.log</string>
+    <string>/Users/jay/Library/Logs/vphone-amfidont.log</string>
 </dict>
 </plist>

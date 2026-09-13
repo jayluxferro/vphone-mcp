@@ -1,0 +1,5 @@
+# vphone-amfidont: allow the login LaunchAgent to run the amfidont daemon
+# as root non-interactively (sudo -n). The agent runs in the user's login
+# session — required for LLDB to attach to amfid — and sudo supplies root.
+# Validate after changes: sudo visudo -c
+jay ALL=(root) NOPASSWD: /Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.9/Resources/Python.app/Contents/MacOS/Python -m amfidont *
