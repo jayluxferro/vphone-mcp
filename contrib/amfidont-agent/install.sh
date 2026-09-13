@@ -21,6 +21,19 @@ PYTHON_BIN="$(xcrun --find python3)" || {
 SITE_PACKAGES="$("$PYTHON_BIN" -m site --user-site)"
 DEVELOPER_DIR="$(xcode-select -p)"
 
+# --- cleanup any previous installs ------------------------------------
+echo "==> Cleaning up previous installs (ignore not-found errors)…"
+launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+sudo launchctl bootout "system/$LABEL" 2>/dev/null || true
+# Stop stray daemons from earlier attempts — only one may be attached
+# to amfid at a time.
+sudo pkill -f 'python.*-m amfidont' 2>/dev/null || true
+rm -f "$AGENT_PLIST"
+sudo rm -f \
+    "/Library/LaunchAgents/$LABEL.plist" \
+    "/Library/LaunchDaemons/$LABEL.plist"
+sudo rm -f "$SUDOERS_DEST"
+
 # --- generate ---------------------------------------------------------
 mkdir -p "$AGENT_DIR" "$HOME_DIR/Library/LaunchAgents"
 HERE="$(cd "$(dirname "$0")" && pwd)"
