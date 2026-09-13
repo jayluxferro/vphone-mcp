@@ -4,6 +4,10 @@
 <dict>
     <key>Label</key>
     <string>com.vphone.amfidont</string>
+    <key>UserName</key>
+    <string>root</string>
+    <key>LimitLoadToSessionType</key>
+    <string>Aqua</string>
     <key>ProgramArguments</key>
     <array>
         <string>/Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.9/Resources/Python.app/Contents/MacOS/Python</string>
