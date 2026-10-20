@@ -14,4 +14,4 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project.scripts]
-vphone-mcp = "vphone_mcp.server:main"
+vphone-mcp = "vphone_mcp.manage:main"

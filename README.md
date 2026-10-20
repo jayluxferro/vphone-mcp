@@ -296,9 +296,9 @@ On all socket tools, `screen` controls the inline post-action screenshot (`scree
 ### Environment Status
 | Tool | Description |
 |------|-------------|
-| `vphone_status` | CLI binary path + PATH presence, resolved socket path + existence, `vm list --json` summary (parsed), running vphone-cli launch PIDs. Never raises. |
+| `vphone_status` | CLI binary path + PATH presence, resolved socket path + existence, `vm list --json` summary (parsed), running VM (vphone-cli / vphone-vm) PIDs. Never raises. |
 
-### vphone-cli Command Wrappers (21 tools)
+### vphone-cli Command Wrappers (20 tools)
 | Tool | Description |
 |------|-------------|
 | `vm_list(json=False, library_root=None)` | List VM bundles (machine-readable with `json=True`) |
@@ -310,20 +310,19 @@ On all socket tools, `screen` controls the inline post-action screenshot (`scree
 | `vm_clone(name=None, new_name=None, library_root=None)` | Clone a VM — the clone gets a fresh device identity, ideal for per-testcase VMs |
 | `vm_export(name=None, out=<required>, max_=False, include_ipsw=False, library_root=None)` | Export a VM to a `.vphone` archive |
 | `vm_import(input=<required>, name=None, library_root=None)` | Import a `.vphone` archive as a new VM |
-| `vm_launch(name=None, dfu=False, headless=False, variant=None, no_vphoned=False, kernel_debug_port=None, project_root=None, library_root=None, verbose=0)` | Launch a VM — blocking process, runs in background with a log file |
+| `vm_launch(name=None, dfu=False, headless=False, api_listen=None, kernel_debug_port=None, project_root=None, library_root=None, verbose=0)` | Launch a VM — blocking process, runs in background with a log file |
 | `vm_stop(name=None, timeout=None, library_root=None, confirm=False)` | Stop a running VM (SIGINT then SIGKILL) |
-| `vm_create(name=<required>, variant=None, iphone_source=None, cloudos_source=None, disk_size=None, sudo_password=None, spoof_build=None, force_dsc_maxslide=False, frida=False, root_popup=False, interactive=False, keep_artifacts=False, project_root=None, verbose=0, library_root=None, confirm=False)` | End-to-end create pipeline (prepare→patch→restore→CFW→boot); needs internet + sudo, long-running |
+| `vm_create(name=<required>, iphone_source=None, cloudos_source=None, gpu_driver_bundle=None, ipsw_cache=None, device=None, disk_size=None, preset=None, keep_artifacts=False, verbose=0, library_root=None, confirm=False)` | End-to-end create pipeline (prepare→patch→restore→CFW→boot); needs internet + sudo, long-running |
 | `fw_catalog(json=False)` | List firmware known to the cache |
 | `fw_prepare(name=None, iphone_source=None, cloudos_source=None, iphone_version=None, iphone_build=None, list_=False, project_root=None, library_root=None, verbose=0)` | Prepare firmware (downloads IPSW/cloudOS, staged in cache) |
-| `fw_patch(name=None, variant=None, force_exc_guard=False, frida=False, quiet=False, library_root=None)` | Patch a prepared firmware set |
-| `restore(name=None, get_shsh=False, offline=False, udid=None, ecid=None, project_root=None, library_root=None, verbose=0, confirm=False)` | Restore a VM from prepared firmware |
-| `cfw_install(name=None, variant='exp', spoof_build=None, force_dsc_maxslide=False, use_sudo=False, keep_artifacts=False, project_root=None, library_root=None, verbose=0, confirm=False)` | Install custom firmware; uses `--root-popup` by default, `use_sudo=True` for the plain sudo re-exec |
-| `patch_firmware(vm_directory=<required>, variant=None, records_out=None, quiet=False, no_binpack=False, no_vphoned=False, force_exc_guard=False, frida=False)` | Patch a VM directory's firmware in place |
+| `fw_patch(name=None, preset=None, quiet=False, library_root=None)` | Patch the boot chain with a patch preset |
+| `restore(name=None, get_shsh=False, offline=False, udid=None, ecid=None, library_root=None, verbose=0, confirm=False)` | Restore a VM from prepared firmware |
+| `cfw_install(name=None, keep_artifacts=False, library_root=None, confirm=False)` | Install custom firmware via host mount; runs under sudo |
+| `patch_firmware(vm_directory=<required>, records_out=None, quiet=False, preset=None)` | Patch a VM directory's boot-chain firmware |
 | `patch_component(component=<required>, input=<required>, output=<required>, quiet=False, records_out=None, target_os=None, frida=False)` | Patch a single firmware component (txm/kernel-base/kernel-jb) |
-| `setup_env(force=False, project_root=None)` | Provision the vphone Python environment (~/.vphone/venv) |
-| `boot(config=<required>, dfu=False, headless=False, kernel_debug_port=None, vphoned_bin=None, variant=None, install_ipa=None, no_vphoned=False)` | Boot from a raw config.plist manifest — blocking process, runs in background with a log file |
+| `boot(config=<required>, dfu=False, headless=False, api_listen=None, kernel_debug_port=None, vphoned_bin=None, install_ipa=None)` | Boot from a raw config.plist manifest — blocking process, runs in background with a log file |
 
-Each wrapper maps 1:1 onto a vphone-cli subcommand (flags use canonical long forms, e.g. `-d/--dfu` is passed as `--dfu`) and reports exit code, argv, stdout, and stderr — a nonzero exit is returned as text for the LLM to read, not an exception. Destructive/privileged tools (`vm_delete`, `vm_stop`, `vm_create`, `restore`, `cfw_install`) require `confirm=True`; `vm_delete` also accepts `force=True` to skip the gate (mirrors the CLI's `-f`). Long-running pipeline tools have generous timeouts and only raise on timeout. `vm_launch` and `boot` are blocking VM processes that run detached, logging to `$VPHONE_ROOT/vphone-mcp/logs/<name>_launch_<epoch>.log`; `sudo_password` for `vm_create` falls back to `VPHONE_SUDO_PASSWORD` so it can stay out of agent context.
+Each wrapper maps 1:1 onto a vphone-cli subcommand (flags use canonical long forms, e.g. `-d/--dfu` is passed as `--dfu`) and reports exit code, argv, stdout, and stderr — a nonzero exit is returned as text for the LLM to read, not an exception. Destructive/privileged tools (`vm_delete`, `vm_stop`, `vm_create`, `restore`, `cfw_install`) require `confirm=True`; `vm_delete` also accepts `force=True` to skip the gate (mirrors the CLI's `-f`). Long-running pipeline tools have generous timeouts and only raise on timeout. `vm_launch` and `boot` are blocking VM processes that run detached, logging to `$VPHONE_ROOT/vphone-mcp/logs/<name>_launch_<epoch>.log`. Privileged commands (`vm_create`, `cfw_install`) run under `sudo` — set `VPHONE_SUDO_PASSWORD` for non-interactive elevation, since the server has no TTY.
 
 ### Not exposed (hostctl socket limitation)
 
@@ -342,15 +341,41 @@ Claude: [calls open_app("Settings")]
         → sees About page with iOS 26.1, Serial: vphone-1337
 ```
 
+## Management CLI
+
+`vphone-mcp` doubles as a host-management tool. With no arguments (or `serve`)
+it runs the MCP server exactly as before; these subcommands reconfigure the
+host and keep the AMFI allowlist in shape:
+
+```
+vphone-mcp versions            # list installed vphone-cli versions
+vphone-mcp select 2.6.0        # pin the version the server drives
+vphone-mcp doctor              # probe env + validate the registry vs the binary
+vphone-mcp escalator status    # AMFI code-requirement allowlist state (needs root)
+vphone-mcp escalator allow     # allow vphone-vm, the companion VM binary (needs root)
+```
+
+- `versions` auto-detects installed launchpad bundles and marks the active one.
+- `select <version>` persists the choice to `~/.vphone/config.json` (or
+  `$VPHONE_MCP_CONFIG`); the server resolves it on next start.
+- `doctor` is the drift backstop: it runs every registry subcommand's `--help`
+  against the live binary and reports any missing subcommand or flag, so a
+  vphone-cli update surfaces as a concrete list instead of a runtime error.
+- `escalator allow` writes the `vphone-vm` cdhash into the AMFI
+  code-requirement allowlist — the same `sudo vphone-escalator allow …` you
+  would otherwise run by hand. `VPHONE_SUDO_PASSWORD` makes it non-interactive.
+
 ## Configuration
 
 | Env var | Description |
 |---------|-------------|
 | `VPHONE_SOCK` | Path to `vphone.sock` (auto-discovered if not set) |
-| `VPHONE_CLI_BIN` | Path to the vphone-cli binary (default: PATH lookup, then /Applications/vphone-cli.app) |
+| `VPHONE_CLI_BIN` | Explicit path to the vphone-cli binary (overrides version selection and auto-detect) |
+| `VPHONE_CLI_VERSION` | Pin a specific installed vphone-cli version, e.g. `2.6.0` (same as `vphone-mcp select`; persisted in `~/.vphone/config.json`) |
+| `VPHONE_MCP_CONFIG` | Config file holding the selected version (default `~/.vphone/config.json`) |
 | `VPHONE_LIBRARY_ROOT` | VM library root override (default: vphone-cli's `~/.vphone/machines`, then legacy `~/.vphone/VMs`) |
 | `VPHONE_ROOT` | vphone project root override (default `~/.vphone`) |
-| `VPHONE_SUDO_PASSWORD` | sudo password fallback for `vm_create` — keeps it out of agent transcripts |
+| `VPHONE_SUDO_PASSWORD` | sudo password for privileged commands (`vm_create`, `cfw_install`, `escalator allow`) — drives `sudo -A` non-interactively; never logged |
 
 ### Transport / remote access
 

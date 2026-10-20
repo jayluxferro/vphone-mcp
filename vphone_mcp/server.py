@@ -391,7 +391,6 @@ def install_ipa(
     name: str | None = None,
     *,
     headless: bool = False,
-    variant: str | None = None,
 ) -> str:
     """Boot a VM with an IPA/TIPA installed once the guest channel connects.
 
@@ -400,7 +399,6 @@ def install_ipa(
             $VPHONE_ROOT/vphone-mcp/uploads/), or a path on the server host
         name: VM name in the library; omit when the library holds exactly one
         headless: boot without a VM window
-        variant: firmware variant (less|regular|dev|jb|exp)
 
     vphone-cli can only install at boot (`boot --install-ipa`), so this BOOTS
     the VM — there is no install-into-a-running-VM path. Stop a running VM with
@@ -431,7 +429,6 @@ def install_ipa(
             config=str(manifest),
             install_ipa=str(candidate),
             headless=headless,
-            variant=variant,
         )
     )
 
@@ -584,26 +581,25 @@ def swipe(
 # ---------------------------------------------------------------------------
 
 def _running_launch_pids() -> list[int]:
-    """PIDs of running vphone-cli processes (vm launch / boot are blocking).
+    """PIDs of running VM processes (vphone-cli launcher + vphone-vm).
 
-    Matches the binary paths only — a bare 'vphone-cli' pattern would also
-    match the amfidont daemon, whose --path argument contains the app name.
+    Since 2.6.0 the VM runs in the companion ``vphone-vm`` binary; the
+    ``vphone-cli`` launcher stays in the foreground streaming the serial
+    console. ``pgrep -x`` matches the process name only, so it never catches
+    the amfidont daemon (whose argv contains the app path but whose process
+    name is Python).
     """
+    pids: set[int] = set()
     try:
-        proc = subprocess.run(
-            [
-                "pgrep",
-                "-f",
-                r"vphone-cli\.app/Contents/MacOS/vphone-cli|"
-                r"/opt/homebrew/bin/vphone-cli|/usr/local/bin/vphone-cli",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
+        for name in ("vphone-cli", "vphone-vm"):
+            proc = subprocess.run(
+                ["pgrep", "-x", name],
+                capture_output=True, text=True, timeout=5,
+            )
+            pids.update(int(p) for p in proc.stdout.split() if p.strip().isdigit())
     except (OSError, subprocess.TimeoutExpired):
-        return []
-    return [int(p) for p in proc.stdout.split() if p.strip().isdigit()]
+        pass
+    return sorted(pids)
 
 
 def _guest_network() -> str:
@@ -784,7 +780,7 @@ def vphone_status() -> str:
     except Exception:
         pids = []
     lines.append(
-        "running vphone-cli processes (binary paths only): "
+        "running VM processes (vphone-cli launcher / vphone-vm): "
         + (", ".join(str(p) for p in pids) if pids else "none")
     )
     return "\n".join(lines)
@@ -858,8 +854,8 @@ def _register_cli_tools() -> None:
                 sig_parts.append(f"{pname}: {tname} | None = None")
         call_parts.append(f"{pname}={pname}")
         if spec.get("env_fallback"):
-            # Secrets (e.g. sudo_password) fall back to an env var so they
-            # never have to appear in agent context.
+            # Secrets fall back to an env var so they never have to appear in
+            # agent context.
             env_fallback_lines.append(
                 f"    if {pname} is None:\n"
                 f"        {pname} = os.environ.get({spec['env_fallback']!r})"
@@ -945,16 +941,16 @@ _register_cli_tools()
 # Entry point
 # ---------------------------------------------------------------------------
 
-def main():
+def main(argv: list[str] | None = None):
     """Serve the tools over stdio (default) or a remote HTTP transport.
 
     Transport, bind address and the bearer token come from the environment
-    (and optional CLI flags) — see :mod:`vphone_mcp.remote`. Imported lazily so
-    a stdio launch never pays for starlette/uvicorn.
+    (and optional CLI flags in ``argv``) — see :mod:`vphone_mcp.remote`.
+    Imported lazily so a stdio launch never pays for starlette/uvicorn.
     """
     from .remote import parse_config, run_server
 
-    run_server(mcp, parse_config())
+    run_server(mcp, parse_config(argv))
 
 
 if __name__ == "__main__":

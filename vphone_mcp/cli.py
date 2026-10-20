@@ -5,12 +5,18 @@ Every vphone-cli subcommand is described by a dict entry in :data:`COMMANDS`
 ``run_background`` detaches blocking commands (vm launch / boot) into a log
 file, and ``format_result`` turns a result dict into a human-readable summary.
 
-The CLI surface here was verified against vphone-cli 1.0.12 (`vphone-cli help`,
+The CLI surface here was verified against vphone-cli 2.6.0 (`vphone-cli help`,
 live runs, and the upstream Swift source): subcommand names, flags, and the
-``vm list --json`` smoke test all match.
+``vm list --json`` smoke test all match. Patch selection moved from per-command
+``--variant``/``--frida``/``--force-exc-guard`` flags to ``--preset`` (see
+``fw patches``), and privileged commands (``cfw install``, ``vm create``) are
+now run under ``sudo`` themselves — the CLI's ``--sudo-password`` /
+``--root-popup`` self-elevation flags are gone.
 """
 
+import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -24,28 +30,114 @@ from . import files
 # Binary resolution (fail loudly)
 # ---------------------------------------------------------------------------
 
+BUNDLES_ROOT = Path("/Library/Application Support/vphone-launchpad/Bundles")
+
+#: The vphone-cli version this registry was verified against. ``vphone-mcp
+#: doctor`` diffs it against the resolved binary and flags drift.
+REGISTRY_VERSION = "2.6.0"
+
+_VERSION_RE = re.compile(r"(?:^|/)Bundles/(\d+\.\d+\.\d+)/")
+
+
+def _config_path() -> Path:
+    return Path(os.environ.get("VPHONE_MCP_CONFIG") or files.vphone_root() / "config.json")
+
+
+def _read_config() -> dict:
+    try:
+        return json.loads(_config_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def _write_config(cfg: dict) -> None:
+    path = _config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(cfg, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def bundle_bin(version: str, name: str = "vphone-cli") -> Path:
+    """Path to a companion binary inside a launchpad bundle of ``version``."""
+    return BUNDLES_ROOT / version / "VPhone.bundle/Contents/MacOS" / name
+
+
+def installed_versions() -> list[str]:
+    """Installed vphone-launchpad bundle versions, newest first."""
+    try:
+        versions = [
+            p.name for p in BUNDLES_ROOT.iterdir() if (p / "VPhone.bundle").is_dir()
+        ]
+    except OSError:
+        return []
+
+    def key(v: str):
+        try:
+            return tuple(int(x) for x in v.split("."))
+        except ValueError:
+            return (0,)
+
+    return sorted(versions, key=key, reverse=True)
+
+
+def detect_version(bin_path: str | Path) -> str | None:
+    """The bundle version a vphone-cli binary belongs to, or None."""
+    m = _VERSION_RE.search(str(bin_path))
+    return m.group(1) if m else None
+
+
+def selected_version() -> str | None:
+    """Explicitly selected version: $VPHONE_CLI_VERSION env, else config file."""
+    if env := os.environ.get("VPHONE_CLI_VERSION", "").strip():
+        return env
+    return _read_config().get("vphone_cli_version")
+
+
+def select_version(version: str) -> None:
+    """Persist the active version selection (``vphone-mcp select``)."""
+    _write_config({"vphone_cli_version": version})
+
+
 def resolve_cli_bin() -> str:
     """Resolve the vphone-cli binary path, or raise RuntimeError.
 
-    Priority: $VPHONE_CLI_BIN env var > ``vphone-cli`` on PATH >
-    /Applications/vphone-cli.app/Contents/MacOS/vphone-cli (the homebrew
-    symlink target). Raises loudly instead of silently falling back to a
-    broken command.
+    Priority:
+    1. ``$VPHONE_CLI_BIN`` — an explicit binary path.
+    2. ``$VPHONE_CLI_VERSION`` env, then the persisted selection — a bundle
+       version under the vphone-launchpad Bundles dir.
+    3. ``vphone-cli`` on PATH.
+    4. The newest installed launchpad bundle (auto-detected).
+    5. /Applications/vphone-cli.app/Contents/MacOS/vphone-cli (legacy).
+
+    Raises loudly instead of silently falling back to a broken command.
     """
     env_bin = os.environ.get("VPHONE_CLI_BIN")
     if env_bin:
         if os.path.isfile(env_bin) and os.access(env_bin, os.X_OK):
             return env_bin
         raise RuntimeError(f"VPHONE_CLI_BIN is set but not an executable file: {env_bin}")
+    version = selected_version()
+    if version:
+        candidate = bundle_bin(version)
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+        raise RuntimeError(
+            f"selected vphone-cli version {version!r} is not installed "
+            f"(no {candidate}) — run `vphone-mcp versions` to see what is available"
+        )
     found = shutil.which("vphone-cli")
     if found:
         return found
+    for version in installed_versions():
+        candidate = bundle_bin(version)
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
     app_bin = Path("/Applications/vphone-cli.app/Contents/MacOS/vphone-cli")
     if app_bin.is_file() and os.access(app_bin, os.X_OK):
         return str(app_bin)
     raise RuntimeError(
         "vphone-cli binary not found: set VPHONE_CLI_BIN, add vphone-cli to "
-        "PATH, or install the app bundle at /Applications/vphone-cli.app"
+        "PATH, or install a launchpad bundle under "
+        f"{BUNDLES_ROOT}/<version>/VPhone.bundle"
     )
 
 
@@ -55,8 +147,7 @@ def resolve_cli_bin() -> str:
 # Option spec kinds (one key selects the kind, the rest are metadata):
 #   {"flag": "--json", "type": bool, "default": False, "help": ...}
 #       bare boolean flag; appended when the value is truthy. An extra
-#       "invert": True flips that (flag appended when the value is FALSY —
-#       used by cfw_install's use_sudo).
+#       "invert": True flips that (flag appended when the value is FALSY).
 #   {"option": "--cpu", "type": int, "help": ...}
 #       "--flag <value>"; default None means omitted. "required": True
 #       makes a missing value raise ValueError.
@@ -65,7 +156,7 @@ def resolve_cli_bin() -> str:
 #   {"positional": "name", "type": str, "help": ...}
 #       positional argument, appended in registry order.
 #       "required": True raises ValueError when missing.
-# Short-flag spellings from the CLI (e.g. -c/--config, -d/--dfu, -V/--variant)
+# Short-flag spellings from the CLI (e.g. -c/--config, -d/--dfu, -p/--preset)
 # are all emitted in their canonical long form, as used elsewhere in the repo.
 
 COMMANDS: dict[str, dict] = {
@@ -251,14 +342,12 @@ COMMANDS: dict[str, dict] = {
                     "help": "Boot into DFU mode"},
             "headless": {"flag": "--headless", "type": bool, "default": False,
                          "help": "Boot without a VM window or menu bar"},
-            "variant": {"option": "--variant", "type": str,
-                        "help": "Firmware variant: less|regular|dev|jb|exp"},
-            "no_vphoned": {"flag": "--no-vphoned", "type": bool, "default": False,
-                           "help": "Exclude vphoned usage (patchless-only)"},
+            "api_listen": {"option": "--api-listen", "type": str,
+                           "help": "Expose the guest HTTP/WebSocket API on host:port (e.g. 127.0.0.1:8765)"},
             "kernel_debug_port": {"option": "--kernel-debug-port", "type": int,
                                   "help": "Kernel GDB debug stub port (6000...65535)"},
             "project_root": {"option": "--project-root", "type": str,
-                             "help": "vphone project root (default ~/.vphone)"},
+                             "help": "Resource base override (default: inferred from the binary path)"},
             "library_root": {"option": "--library-root", "type": str,
                              "help": "VM library root (default ~/.vphone/machines or $VPHONE_LIBRARY_ROOT)"},
             "verbose": {"option_multi": "-v", "type": int, "default": 0,
@@ -289,45 +378,29 @@ COMMANDS: dict[str, dict] = {
         "help": (
             "Run the end-to-end VM creation pipeline for a new bundle: "
             "prepare, patch, restore, CFW install, first boot. Needs internet "
-            "for firmware downloads and sudo for the CFW stage; long-running "
-            "(may take an hour). Requires confirm=True."
+            "for firmware downloads and runs under sudo for the CFW stage "
+            "(set VPHONE_SUDO_PASSWORD for non-interactive elevation); "
+            "long-running (may take an hour). Requires confirm=True."
         ),
         "options": {
             "name": {"positional": "name", "type": str, "required": True,
                      "help": "Name of the new VM bundle"},
-            "variant": {"option": "--variant", "type": str,
-                        "help": "Firmware variant: regular|dev|jb|exp|less (default regular)"},
             "iphone_source": {"option": "--iphone-source", "type": str,
                               "help": "iPhone IPSW URL or local path"},
             "cloudos_source": {"option": "--cloudos-source", "type": str,
                                "help": "cloudOS IPSW URL or local path"},
+            "gpu_driver_bundle": {"option": "--gpu-driver-bundle", "type": str,
+                                  "help": "GPU driver bundle from the same cloudOS build (offline AEA recovery)"},
+            "ipsw_cache": {"option": "--ipsw-cache", "type": str,
+                           "help": "Directory for downloaded IPSWs (default ~/.vphone/ipsws)"},
+            "device": {"option": "--device", "type": str,
+                       "help": "Guest device when the IPSW covers several models (e.g. iPad15,5)"},
             "disk_size": {"option": "--disk-size", "type": int,
                           "help": "Disk size in GB (default 64)"},
-            "sudo_password": {
-                "option": "--sudo-password", "type": str,
-                "env_fallback": "VPHONE_SUDO_PASSWORD",
-                "help": (
-                    "sudo password for the CFW host-mount (passed via askpass, "
-                    "never logged by the CLI). WARNING: passing this as an MCP "
-                    "argument puts it in agent transcripts — prefer setting the "
-                    "VPHONE_SUDO_PASSWORD env var instead; the tool falls back "
-                    "to that env value when the param is omitted."
-                ),
-            },
-            "spoof_build": {"option": "--spoof-build", "type": str,
-                            "help": "(exp only) rewrite ProductBuildVersion to this build id"},
-            "force_dsc_maxslide": {"flag": "--force-dsc-maxslide", "type": bool, "default": False,
-                                   "help": "Force a fixed dsc maxslide value"},
-            "frida": {"flag": "--frida", "type": bool, "default": False,
-                      "help": "Install re.frida.server (latest GitHub release) + jb/exp kernel relaxations"},
-            "root_popup": {"flag": "--root-popup", "type": bool, "default": False,
-                           "help": "Elevate CFW via macOS auth dialog (osascript) instead of sudo prompt"},
-            "interactive": {"flag": "--interactive", "type": bool, "default": False,
-                            "help": "Prompt at first-boot stages instead of non-interactive"},
+            "preset": {"option": "--preset", "type": str,
+                       "help": "Patch preset (default standard; see `fw patches`)"},
             "keep_artifacts": {"flag": "--keep-artifacts", "type": bool, "default": False,
-                               "help": "Keep build artifacts after installing"},
-            "project_root": {"option": "--project-root", "type": str,
-                             "help": "vphone project root (default ~/.vphone)"},
+                               "help": "Keep the prepared restore tree after installation"},
             "verbose": {"option_multi": "-v", "type": int, "default": 0,
                         "help": "Verbosity level; repeat -v up to N times"},
             "library_root": {"option": "--library-root", "type": str,
@@ -336,6 +409,7 @@ COMMANDS: dict[str, dict] = {
         "timeout_s": 7200,
         "confirm": True,
         "allow_background": True,
+        "sudo": True,
     },
     "fw_catalog": {
         "argv": ["fw", "catalog"],
@@ -382,20 +456,16 @@ COMMANDS: dict[str, dict] = {
     "fw_patch": {
         "argv": ["fw", "patch"],
         "help": (
-            "Patch a prepared firmware set for a VM (variant-specific "
-            "patches, optional force-exc-guard, frida, quiet). Long-running."
+            "Patch the boot chain for a VM with a patch preset (see "
+            "`fw patches` for what each preset applies). Long-running."
         ),
         "options": {
             "name": {"positional": "name", "type": str,
                      "help": "Name of the firmware set to patch"},
-            "variant": {"option": "--variant", "type": str,
-                        "help": "Firmware variant: less|regular|dev|jb|exp"},
-            "force_exc_guard": {"flag": "--force-exc-guard", "type": bool, "default": False,
-                                "help": "Force-enable the EXC_GUARD (Mach port guard) disable patch"},
-            "frida": {"flag": "--frida", "type": bool, "default": False,
-                      "help": "Opt in to Frida Stalker kernel relaxations (jb/exp only)"},
+            "preset": {"option": "--preset", "type": str,
+                       "help": "Patch preset (default: the VM's recorded choice, else standard)"},
             "quiet": {"flag": "--quiet", "type": bool, "default": False,
-                      "help": "Suppress progress output"},
+                      "help": "Suppress per-component progress"},
             "library_root": {"option": "--library-root", "type": str,
                              "help": "VM library root (default ~/.vphone/machines or $VPHONE_LIBRARY_ROOT)"},
         },
@@ -419,9 +489,7 @@ COMMANDS: dict[str, dict] = {
             "udid": {"option": "--udid", "type": str,
                      "help": "Override the device UDID"},
             "ecid": {"option": "--ecid", "type": str,
-                     "help": "Override the device ECID"},
-            "project_root": {"option": "--project-root", "type": str,
-                             "help": "vphone project root (default ~/.vphone)"},
+                     "help": "Device ECID (default: from the bundle's udid-prediction.txt)"},
             "library_root": {"option": "--library-root", "type": str,
                              "help": "VM library root (default ~/.vphone/machines or $VPHONE_LIBRARY_ROOT)"},
             "verbose": {"option_multi": "-v", "type": int, "default": 0,
@@ -435,61 +503,39 @@ COMMANDS: dict[str, dict] = {
         "argv": ["cfw", "install"],
         "help": (
             "Install the custom firmware (CFW) into a VM bundle via host "
-            "mount — the VM must be off. Long-running and privileged. "
-            "Requires confirm=True. By default passes --root-popup (osascript "
-            "auth dialog); set use_sudo=True to use vphone-cli's plain sudo "
-            "re-exec instead."
+            "mount — the VM must be off. The boot chain follows `fw patch`'s "
+            "plan and the guest half follows the VM's current patch selection. "
+            "Runs under sudo (set VPHONE_SUDO_PASSWORD for non-interactive "
+            "elevation). Long-running. Requires confirm=True."
         ),
         "options": {
             "name": {"positional": "name", "type": str,
                      "help": "VM name to install CFW into (defaults to the only VM in the library)"},
-            "variant": {"option": "--variant", "type": str, "default": "exp",
-                        "help": "Firmware variant: less|regular|dev|jb|exp (default exp)"},
-            "spoof_build": {"option": "--spoof-build", "type": str,
-                            "help": "Build number to spoof to the guest"},
-            "force_dsc_maxslide": {"flag": "--force-dsc-maxslide", "type": bool, "default": False,
-                                   "help": "Force a fixed dsc maxslide value"},
-            "use_sudo": {"flag": "--root-popup", "type": bool, "default": False,
-                         "invert": True,
-                         "help": "Use the default sudo re-exec instead of --root-popup (needs a TTY, which the MCP server lacks)"},
             "keep_artifacts": {"flag": "--keep-artifacts", "type": bool, "default": False,
-                               "help": "Keep build artifacts after installing"},
-            "project_root": {"option": "--project-root", "type": str,
-                             "help": "vphone project root (default ~/.vphone)"},
+                               "help": "Keep the extracted firmware after install (default: removed to save space)"},
             "library_root": {"option": "--library-root", "type": str,
                              "help": "VM library root (default ~/.vphone/machines or $VPHONE_LIBRARY_ROOT)"},
-            "verbose": {"option_multi": "-v", "type": int, "default": 0,
-                        "help": "Verbosity level; repeat -v up to N times"},
         },
         "timeout_s": 7200,
         "confirm": True,
         "allow_background": True,
-        "sudo_env": True,
+        "sudo": True,
     },
     "patch_firmware": {
         "argv": ["patch-firmware"],
         "help": (
-            "Patch an existing VM directory's firmware in place with "
-            "variant-specific patches (records-out, no-binpack, no-vphoned, "
-            "force-exc-guard, frida options). Long-running."
+            "Patch boot-chain firmware in a VM directory with the Swift "
+            "pipeline (records-out, quiet, preset options). Long-running."
         ),
         "options": {
             "vm_directory": {"option": "--vm-directory", "type": str, "required": True,
-                             "help": "Path to the VM directory to patch"},
-            "variant": {"option": "--variant", "type": str,
-                        "help": "Firmware variant: less|regular|dev|jb|exp"},
+                             "help": "Path to the VM directory containing the *Restore* folder"},
             "records_out": {"option": "--records-out", "type": str,
-                            "help": "Write patch records to this JSON file"},
+                            "help": "Write emitted PatchRecord JSON to this path"},
             "quiet": {"flag": "--quiet", "type": bool, "default": False,
-                      "help": "Suppress progress output"},
-            "no_binpack": {"flag": "--no-binpack", "type": bool, "default": False,
-                           "help": "Exclude the SSH, VNC, ... binaries (patchless-only)"},
-            "no_vphoned": {"flag": "--no-vphoned", "type": bool, "default": False,
-                           "help": "Exclude vphoned usage (patchless-only)"},
-            "force_exc_guard": {"flag": "--force-exc-guard", "type": bool, "default": False,
-                                "help": "Force-enable the EXC_GUARD (Mach port guard) disable patch"},
-            "frida": {"flag": "--frida", "type": bool, "default": False,
-                      "help": "Opt in to Frida Stalker kernel relaxations (jb/exp only)"},
+                      "help": "Suppress per-component progress"},
+            "preset": {"option": "--preset", "type": str,
+                       "help": "Patch preset (default standard; individual patches are selected per VM by `fw patch`)"},
         },
         "timeout_s": 3600,
         "allow_background": True,
@@ -520,21 +566,6 @@ COMMANDS: dict[str, dict] = {
         "timeout_s": 1800,
         "allow_background": True,
     },
-    "setup_env": {
-        "argv": ["setup"],
-        "help": (
-            "Provision the vphone Python environment (~/.vphone/venv) and "
-            "prerequisites. force=True re-runs even if already set up."
-        ),
-        "options": {
-            "force": {"flag": "--force", "type": bool, "default": False,
-                      "help": "Re-run setup even if already provisioned"},
-            "project_root": {"option": "--project-root", "type": str,
-                             "help": "vphone project root (default ~/.vphone)"},
-        },
-        "timeout_s": 1800,
-        "allow_background": True,
-    },
     "boot": {
         "argv": ["boot"],
         "help": (
@@ -549,16 +580,14 @@ COMMANDS: dict[str, dict] = {
                     "help": "Boot into DFU mode"},
             "headless": {"flag": "--headless", "type": bool, "default": False,
                          "help": "Boot without a VM window or menu bar"},
+            "api_listen": {"option": "--api-listen", "type": str,
+                           "help": "Expose the guest HTTP/WebSocket API on host:port (e.g. 127.0.0.1:8765)"},
             "kernel_debug_port": {"option": "--kernel-debug-port", "type": int,
                                   "help": "Kernel GDB debug stub port (6000...65535)"},
             "vphoned_bin": {"option": "--vphoned-bin", "type": str,
-                            "help": "Path to signed vphoned binary"},
-            "variant": {"option": "--variant", "type": str,
-                        "help": "Firmware variant: less|regular|dev|jb|exp"},
+                            "help": "Path to signed vphoned binary (default .vphoned.signed)"},
             "install_ipa": {"option": "--install-ipa", "type": str,
                             "help": "Install IPA/TIPA after the guest control channel connects (unavailable with dfu)"},
-            "no_vphoned": {"flag": "--no-vphoned", "type": bool, "default": False,
-                           "help": "Exclude vphoned usage (patchless-only)"},
         },
         "timeout_s": 0,  # n/a — background entry
         "background": True,
@@ -664,25 +693,32 @@ def _build_argv(entry: dict, params: dict) -> list[str]:
 # Runner
 # ---------------------------------------------------------------------------
 
-def _sudo_askpass_env() -> dict:
-    """Askpass env for commands that self-elevate via sudo -A.
+def _sudo_prefix() -> tuple[list[str], dict, str | None]:
+    """argv prefix + env + askpass-path for commands declared ``sudo: True``.
 
-    When VPHONE_SUDO_PASSWORD is set, writes a 0700 askpass helper in /tmp and
-    exports SUDO_ASKPASS + SUDO_PASSWORD so the CLI's scripts (which honor
-    ``sudo ${SUDO_ASKPASS:+-A}``) elevate without a TTY. The helper is removed
-    after a synchronous run; for background runs it stays until the command
-    exits (the elevation happens early). Same mechanism vphone-cli's own
-    vm-create orchestrator uses for --sudo-password.
+    vphone-cli 2.6.0 dropped --sudo-password/--root-popup; privileged commands
+    (``cfw install``, ``vm create``) must be run under sudo themselves. With
+    VPHONE_SUDO_PASSWORD set, ``sudo -A`` drives a 0700 askpass helper in /tmp
+    (returned as the third element so the caller can remove it); otherwise
+    ``sudo -n`` fails loudly rather than hanging on a TTY prompt.
     """
     pw = os.environ.get("VPHONE_SUDO_PASSWORD")
     if not pw:
-        return {}
+        return ["sudo", "-n"], {}, None
     fd, path = tempfile.mkstemp(prefix="vphone-sudo-askpass.")
     safe = pw.replace("'", "'\\''")
     os.write(fd, f"#!/bin/sh\necho '{safe}'\n".encode())
     os.close(fd)
     os.chmod(path, 0o700)
-    return {"SUDO_ASKPASS": path, "SUDO_PASSWORD": pw}
+    return ["sudo", "-A"], {"SUDO_ASKPASS": path}, path
+
+
+def _unlink_askpass(path: str | None) -> None:
+    if path:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
 
 
 def run(cmd_key: str, **params) -> dict:
@@ -692,28 +728,34 @@ def run(cmd_key: str, **params) -> dict:
     code still returns normally (the MCP tool formats it so the LLM sees the
     error). Raises RuntimeError on subprocess timeout (including partial
     output), ValueError on bad arguments, and RuntimeError if the binary is
-    missing.
+    missing. Entries declared ``sudo: True`` run under sudo.
     """
     entry = _entry(cmd_key)
     argv = _build_argv(entry, params)
     timeout = entry.get("timeout_s", _DEFAULT_TIMEOUT_S)
     timeout = None if timeout <= 0 else timeout
     env = os.environ.copy()
-    if entry.get("sudo_env"):
-        env.update(_sudo_askpass_env())
+    askpass_path = None
+    if entry.get("sudo"):
+        prefix, senv, askpass_path = _sudo_prefix()
+        argv = prefix + argv
+        env.update(senv)
     try:
-        proc = subprocess.run(
-            argv, capture_output=True, text=True, timeout=timeout, env=env
-        )
-    except subprocess.TimeoutExpired as exc:
-        partial = ""
-        if exc.stdout:
-            partial += f"\npartial stdout:\n{exc.stdout}"
-        if exc.stderr:
-            partial += f"\npartial stderr:\n{exc.stderr}"
-        raise RuntimeError(
-            f"vphone-cli {cmd_key} timed out after {timeout}s{partial}"
-        ) from exc
+        try:
+            proc = subprocess.run(
+                argv, capture_output=True, text=True, timeout=timeout, env=env
+            )
+        except subprocess.TimeoutExpired as exc:
+            partial = ""
+            if exc.stdout:
+                partial += f"\npartial stdout:\n{exc.stdout}"
+            if exc.stderr:
+                partial += f"\npartial stderr:\n{exc.stderr}"
+            raise RuntimeError(
+                f"vphone-cli {cmd_key} timed out after {timeout}s{partial}"
+            ) from exc
+    finally:
+        _unlink_askpass(askpass_path)
     return {
         "exit_code": proc.returncode,
         "stdout": proc.stdout or "",
@@ -728,7 +770,9 @@ def run_background(cmd_key: str, **params) -> dict:
     Only entries declared with ``background: True`` are accepted. The child is
     started in its own session (survives the MCP server) with stdout+stderr
     streamed to ``$VPHONE_ROOT/vphone-mcp/logs/<name-or-cmd>_launch_<epoch>.log``
-    (a file-endpoint root, so the log is fetchable remotely).
+    (a file-endpoint root, so the log is fetchable remotely). Entries declared
+    ``sudo: True`` run under sudo; the askpass helper is left in /tmp for sudo
+    to consume during startup.
     Returns ``{"pid", "log_path", "argv"}``.
     """
     entry = _entry(cmd_key)
@@ -741,8 +785,10 @@ def run_background(cmd_key: str, **params) -> dict:
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"{stem}_launch_{int(time.time())}.log"
     env = os.environ.copy()
-    if entry.get("sudo_env"):
-        env.update(_sudo_askpass_env())
+    if entry.get("sudo"):
+        prefix, senv, _ = _sudo_prefix()
+        argv = prefix + argv
+        env.update(senv)
     with open(log_path, "ab") as logf:
         proc = subprocess.Popen(
             argv,
@@ -752,6 +798,101 @@ def run_background(cmd_key: str, **params) -> dict:
             env=env,
         )
     return {"pid": proc.pid, "log_path": str(log_path), "argv": argv}
+
+
+# ---------------------------------------------------------------------------
+# vphone-escalator (AMFI code-requirement allowlist)
+# ---------------------------------------------------------------------------
+
+def escalator_bin() -> str:
+    """The vphone-escalator binary next to the resolved vphone-cli."""
+    candidate = Path(resolve_cli_bin()).with_name("vphone-escalator")
+    if candidate.is_file() and os.access(candidate, os.X_OK):
+        return str(candidate)
+    raise RuntimeError(f"vphone-escalator not found next to {resolve_cli_bin()}")
+
+
+def vm_bin() -> str:
+    """The vphone-vm companion binary next to the resolved vphone-cli."""
+    candidate = Path(resolve_cli_bin()).with_name("vphone-vm")
+    if candidate.is_file() and os.access(candidate, os.X_OK):
+        return str(candidate)
+    raise RuntimeError(f"vphone-vm not found next to {resolve_cli_bin()}")
+
+
+def escalator_status() -> dict:
+    """Run ``vphone-escalator status`` (needs root) and return the result."""
+    prefix, senv, askpass = _sudo_prefix()
+    argv = prefix + [escalator_bin(), "status"]
+    env = os.environ.copy()
+    env.update(senv)
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=30, env=env)
+    finally:
+        _unlink_askpass(askpass)
+    return {"exit_code": proc.returncode, "stdout": proc.stdout or "", "stderr": proc.stderr or "", "argv": argv}
+
+
+def escalator_allow(binaries: list[str] | None = None) -> dict:
+    """Run ``sudo vphone-escalator allow <vphone-vm>`` for the resolved VM binary.
+
+    This writes the vphone-vm cdhash into the AMFI code-requirement allowlist
+    so the virtualization-entitled companion binary can launch. Idempotent —
+    running it again refreshes the same entries.
+    """
+    targets = binaries or [vm_bin()]
+    prefix, senv, askpass = _sudo_prefix()
+    argv = prefix + [escalator_bin(), "allow", *targets]
+    env = os.environ.copy()
+    env.update(senv)
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=60, env=env)
+    finally:
+        _unlink_askpass(askpass)
+    return {"exit_code": proc.returncode, "stdout": proc.stdout or "", "stderr": proc.stderr or "", "argv": argv}
+
+
+# ---------------------------------------------------------------------------
+# Registry validation (vphone-cli version drift)
+# ---------------------------------------------------------------------------
+
+def validate_registry(bin_path: str | None = None) -> list[dict]:
+    """Flag registry entries whose subcommand or flags differ from the binary.
+
+    Runs ``<bin> <argv> --help`` for every COMMANDS entry and reports (a) a
+    subcommand that no longer exists, and (b) any flag/option string absent
+    from the binary's help. Empty list means the registry matches. This is the
+    backstop for the next vphone-cli update: ``vphone-mcp doctor`` surfaces
+    drift before a tool call fails at runtime.
+    """
+    bin_path = bin_path or resolve_cli_bin()
+    findings: list[dict] = []
+    for key, entry in COMMANDS.items():
+        argv = [bin_path, *entry["argv"], "--help"]
+        try:
+            proc = subprocess.run(argv, capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            findings.append({"command": key, "kind": "subcommand", "detail": str(exc)})
+            continue
+        help_text = (proc.stdout or "") + (proc.stderr or "")
+        lowered = help_text.lower()
+        if (
+            "unknown subcommand" in lowered
+            or "unexpected argument" in lowered
+            or "missing expected argument" in lowered
+        ):
+            first = help_text.strip().splitlines()[0] if help_text.strip() else "?"
+            findings.append({"command": key, "kind": "subcommand", "detail": first})
+            continue
+        for pname, spec in entry["options"].items():
+            for kind in ("flag", "option", "option_multi"):
+                if kind in spec and spec[kind] not in help_text:
+                    findings.append({
+                        "command": key,
+                        "kind": "flag",
+                        "detail": f"{spec[kind]} ({pname})",
+                    })
+    return findings
 
 
 def format_result(res: dict) -> str:

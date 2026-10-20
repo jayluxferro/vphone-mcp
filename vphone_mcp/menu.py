@@ -1,6 +1,7 @@
-"""Drive vphone-cli's own AppKit menu through macOS Accessibility.
+"""Drive the VM app's own AppKit menu through macOS Accessibility.
 
-vphone-cli records the screen far more cheaply than this server can: its
+The VM app (``vphone-vm`` since vphone-cli 2.6.0) records the screen far more
+cheaply than this server can: its
 ``VPhoneScreenRecorder`` feeds ``AVAssetWriterInputPixelBufferAdaptor``
 straight from the VM view in-process — no PNG per frame, no IPC, no ffmpeg.
 It is not on the host control socket though (``{"t":"record"}`` answers
@@ -19,7 +20,7 @@ import subprocess
 
 PROCESS_ENV = "VPHONE_MCP_APP_PROCESS"
 KEYWORDS_ENV = "VPHONE_MCP_RECORD_MENU_KEYWORDS"
-DEFAULT_PROCESS = "vphone-cli"
+DEFAULT_PROCESS = "vphone-vm"
 DEFAULT_KEYWORDS = ("record",)
 
 #: -1719/-1743 are "not allowed assistive access" / "not authorised".
