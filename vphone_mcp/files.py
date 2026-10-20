@@ -2,11 +2,11 @@
 
 Tool results name paths on the *server* host — the screenshot PNG, a launch
 log. That is all a local stdio client needs, but a remote agent cannot open any
-of them. This module turns such a path into a fetchable URL::
+of them. This module turns such a path into a fetchable, short-lived link::
 
-    http://<hash>:<mcp-token>@host:8765/files/screenshots/screen.png
-           └ sha256 of the resolved absolute path
-                   └ the same bearer token the MCP endpoint uses
+    http://<expires>:<signature>@host:8765/files/screenshots/screen.png
+           │         └ HMAC-SHA256 over (method, canonical path, expires)
+           └ unix time the link stops working (default: minted + 1h)
 
 Exactly one directory is served: ``$VPHONE_ROOT/vphone-mcp``, which is this
 server's own — ``logs/``, ``screenshots/``, ``recordings/`` and ``uploads/``. The VM library and
@@ -14,28 +14,45 @@ the rest of the vphone root stay unreachable; anything worth fetching is written
 here. ``uploads/`` is the one writable spot: a client PUTs an IPA there (through
 a URL minted by ``create_upload_url``) and then installs it.
 
-The URL exposes a path relative to that root, and carries the hash of the full
-path it was minted for as the Basic-auth *user*, with the MCP token as the
-*password*. Serving therefore needs no state at all: join the relative path onto
-the root, normalise it, and serve only when the result stays inside the root, is
-the spelling this module would have minted for it, and hashes to what the
-request presented. A tampered path — ``../``, an absolute path, a different
-file — resolves elsewhere, so its hash no longer matches and it never reaches
-the filesystem. Paths are resolved before the scope check, so a symlink inside
-the root pointing outside it is rejected too.
+The links end up in tool results, so in model context and transcripts.
+That is why they carry a capability, not the MCP token. Earlier versions put the
+token itself in the Basic password, and every screenshot then leaked the key to
+the whole server. A link now authorises one method on one file until it
+expires, and nothing else. Its signing key is derived from the token (see
+:func:`_link_key`), so the token is never in a link and cannot be recovered from
+one. Rotating the token revokes every outstanding link.
+
+Serving stays stateless: nothing remembers which links were handed out.
+:func:`check_link` recomputes the signature from the request's own method, path
+and expiry. It does that before the requested path is looked up on disk, so an
+unauthenticated request never gets a ``stat`` of anything it named. The signed path is the
+canonical spelling :func:`relative_path` mints, so a tampered path (``../``, an
+absolute path, a different file) no longer matches its signature and gets a
+401. After that the usual scope rules still apply: paths are resolved before
+the scope check, so a symlink inside the root that points outside it is
+rejected even when the link is genuine.
 """
 
 import hashlib
 import hmac
 import os
+import re
+import secrets
 import time
 from pathlib import Path
 from urllib.parse import quote
 
 ROUTE_PREFIX = "/files"
 
+#: Link lifetime when $VPHONE_MCP_LINK_TTL_SECONDS is unset, and its ceiling.
+#: The ceiling exists so a typo cannot quietly turn links into long-lived
+#: credentials again.
+DEFAULT_LINK_TTL = 3600
+MAX_LINK_TTL = 7 * 86400
+
 _base_url = ""  # scheme://host[:port], set for network transports
-_token = ""  # MCP bearer token, used as the Basic-auth password
+_key = b""  # signs file links; derived from the MCP token, never the token itself
+_ttl = DEFAULT_LINK_TTL
 
 
 # ---------------------------------------------------------------------------
@@ -157,13 +174,86 @@ def scope_error(path: str | Path) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Hash / lookup
+# Signed links
 # ---------------------------------------------------------------------------
 
-def hash_for(path: str | Path) -> str:
-    """SHA-256 of the resolved absolute path — the Basic-auth user."""
-    return hashlib.sha256(str(_resolved(path)).encode()).hexdigest()
+class LinkError(Exception):
+    """The request's credentials are not a live link for it (answered 401)."""
 
+
+_EXPIRES = re.compile(r"[0-9]{1,12}")
+
+
+def _link_key(token: str) -> bytes:
+    """The key that signs file links.
+
+    It is an HMAC of the token under a fixed label, not the token itself, so a
+    signature is useless anywhere except this endpoint. The derivation is
+    deterministic, which means links survive a restart under the same token.
+    With no token at all (``--allow-anonymous``) there is nothing to derive
+    from, so the key is random per process: links are still unforgeable, and
+    they last only until the server restarts.
+    """
+    if not token:
+        return secrets.token_bytes(32)
+    return hmac.new(
+        token.encode("utf-8"), b"vphone-mcp file link v1", hashlib.sha256
+    ).digest()
+
+
+def _utf8(text: str) -> bytes:
+    # compare_digest() raises TypeError on a non-ASCII str (a 500 from any
+    # client sending "é" as credentials), so everything is compared as bytes.
+    # surrogatepass encodes every str, so the encoding cannot raise either.
+    return text.encode("utf-8", "surrogatepass")
+
+
+def _signature(method: str, relative: str, expires: int) -> str:
+    """Hex HMAC over (method, canonical absolute path, expiry).
+
+    The path is built from the relative spelling, root + "/" + relative, the
+    same way at minting and at checking. A non-canonical spelling of the same
+    file therefore signs differently. NUL separates the fields because it
+    cannot occur in a path, a method or a decimal number, so no two
+    (method, path, expiry) triples produce the same message.
+    """
+    message = b"\0".join(
+        (_utf8(method), _utf8(f"{root()}/{relative}"), str(expires).encode())
+    )
+    return hmac.new(_key, message, hashlib.sha256).hexdigest()
+
+
+def check_link(method: str, relative: str, expires: str, signature: str) -> None:
+    """Raise :class:`LinkError` unless the credentials are a live link minted
+    for exactly this method and relative path.
+
+    Nothing here looks at the requested path on disk (the only filesystem
+    access is resolving the fixed server root), so it runs first. HEAD counts
+    as GET. The signature is checked before the expiry, so
+    "expired" is only ever said about a link this server really minted.
+    """
+    if not _key:
+        raise LinkError("file links are not enabled on this server")
+    method = "GET" if method == "HEAD" else method
+    if not _EXPIRES.fullmatch(expires) or "\x00" in relative:
+        raise LinkError("not a file link minted by this server")
+    expected = _signature(method, relative, int(expires))
+    if not hmac.compare_digest(_utf8(expected), _utf8(signature)):
+        raise LinkError(
+            f"this link is not valid for {method} on this path: links are "
+            "minted per file and method by the tools that report the file"
+        )
+    if int(expires) < time.time():
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(int(expires)))
+        raise LinkError(
+            f"this link expired at {stamp}: ask for a fresh one "
+            "(get_file_url for downloads, create_upload_url for uploads)"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Lookup
+# ---------------------------------------------------------------------------
 
 def relative_path(path: str | Path) -> str | None:
     """Path relative to the root, or None when it is out of scope."""
@@ -172,16 +262,16 @@ def relative_path(path: str | Path) -> str | None:
     return _resolved(path).relative_to(root()).as_posix()
 
 
-def resolve(relative: str, presented_hash: str) -> Path | None:
-    """The file a request is for, or None.
+def resolve(relative: str, expires: str, signature: str) -> Path | None:
+    """The file a GET/HEAD is for, or None (404).
 
-    Served only when the relative path, joined onto the root and normalised,
-    stays inside it, is the canonical spelling of the result (the one
-    :func:`relative_path` would mint, so each file has exactly one URL), hashes
-    to what the request presented, and is a regular file.
+    Raises :class:`LinkError` (401) when the credentials are not a live GET
+    link for this exact path. Once they are, the file is served only if the
+    path, joined onto the root and normalised, still stays inside it and is
+    still the canonical spelling (a component may have become a symlink since
+    the link was minted), and if it is a regular file.
     """
-    if not presented_hash or "\x00" in relative:
-        return None
+    check_link("GET", relative, expires, signature)
     # An absolute path would swallow the root in the join below.
     relative = relative.lstrip("/")
     try:
@@ -189,8 +279,6 @@ def resolve(relative: str, presented_hash: str) -> Path | None:
     except (OSError, RuntimeError):
         return None
     if relative_path(candidate) != relative:
-        return None
-    if not hmac.compare_digest(hash_for(candidate), presented_hash):
         return None
     if not candidate.is_file():
         return None
@@ -281,15 +369,15 @@ def safe_filename(filename: str) -> str:
     return name
 
 
-def upload_target(relative: str, presented_hash: str) -> Path | None:
-    """The path an upload may be written to, or None.
+def upload_target(relative: str, expires: str, signature: str) -> Path | None:
+    """The path a PUT may write, or None (404).
 
-    Same rules as :func:`resolve` — canonical spelling, hash match — minus the
-    existence check (the file is being created), plus the restriction that
-    ``uploads/`` is the only writable directory.
+    The same rules as :func:`resolve`, but checked against a PUT link (a GET
+    link for the same file cannot overwrite it). The existence check is
+    dropped, since the file is being created, and ``uploads/`` must be the
+    parent: it is the only writable directory, whatever a link says.
     """
-    if not presented_hash or "\x00" in relative:
-        return None
+    check_link("PUT", relative, expires, signature)
     relative = relative.lstrip("/")
     try:
         candidate = _resolved(root() / relative)
@@ -298,8 +386,6 @@ def upload_target(relative: str, presented_hash: str) -> Path | None:
     if candidate.parent != upload_dir():
         return None
     if relative_path(candidate) != relative:
-        return None
-    if not hmac.compare_digest(hash_for(candidate), presented_hash):
         return None
     if candidate.is_dir():
         return None
@@ -310,30 +396,47 @@ def upload_target(relative: str, presented_hash: str) -> Path | None:
 # URL emission
 # ---------------------------------------------------------------------------
 
-def configure(base_url: str, token: str) -> None:
-    """Enable URL emission against a base like ``https://host:8765``."""
-    global _base_url, _token
+def configure(base_url: str, token: str, ttl: int = DEFAULT_LINK_TTL) -> None:
+    """Enable link emission against a base like ``https://host:8765``.
+
+    Only the derived signing key is kept; the token is not stored here.
+    """
+    global _base_url, _key, _ttl
     _base_url = base_url.rstrip("/")
-    _token = token
+    _key = _link_key(token)
+    _ttl = ttl
 
 
 def enabled() -> bool:
     return bool(_base_url)
 
 
+def link_ttl() -> int:
+    """Seconds a newly minted link stays valid."""
+    return _ttl
+
+
 def upload_url(filename: str) -> str | None:
-    """URL a client can PUT ``filename`` to, or None when not serving remotely."""
-    return url_for(upload_dir() / safe_filename(filename))
+    """PUT link for ``uploads/<filename>``, or None when not serving remotely."""
+    return _mint("PUT", upload_dir() / safe_filename(filename))
 
 
 def url_for(path: str | Path) -> str | None:
-    """Return the URL for a servable path, or None when it is not servable."""
+    """GET link for a servable path, or None when it is not servable."""
+    return _mint("GET", path)
+
+
+def _mint(method: str, path: str | Path) -> str | None:
     if not _base_url:
         return None
     relative = relative_path(path)
     if relative is None:
         return None
+    expires = int(time.time()) + _ttl
     scheme, sep, host = _base_url.partition("://")
-    userinfo = f"{hash_for(path)}:{quote(_token, safe='')}@"
+    # Basic credentials ride in the URL, so `curl -O '<url>'` and
+    # `curl -T file '<url>'` need nothing else. Both halves are plain ASCII
+    # ([0-9] and [0-9a-f]), so there is nothing to percent-encode.
+    userinfo = f"{expires}:{_signature(method, relative, expires)}@"
     segments = "/".join(quote(part, safe="") for part in relative.split("/"))
     return f"{scheme}{sep}{userinfo}{host}{ROUTE_PREFIX}/{segments}"

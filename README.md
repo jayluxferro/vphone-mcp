@@ -77,15 +77,24 @@ On the VM host:
 
 ```bash
 export VPHONE_MCP_AUTH_TOKEN="$(openssl rand -hex 32)"   # keep this value
-uv run vphone-mcp --transport http --host 0.0.0.0 --port 8765
+uv run vphone-mcp --transport http --port 8765           # binds 127.0.0.1
 ```
 
-From anywhere that can reach it:
+From another machine, tunnel the port over SSH and point the client at the
+tunnel's local end:
 
 ```bash
-claude mcp add --transport http vphone https://vphone.example.com/mcp \
+ssh -N -L 8765:127.0.0.1:8765 you@vm-host &
+claude mcp add --transport http vphone http://127.0.0.1:8765/mcp \
   --header "Authorization: Bearer $VPHONE_MCP_AUTH_TOKEN"
 ```
+
+The server stays on loopback and the token only travels inside SSH. Tailscale
+serve is the other route that exposes nothing to the LAN (see
+[contrib/launchd/README.md](contrib/launchd/README.md#reaching-it-from-another-machine)).
+`--host 0.0.0.0` serves the LAN directly instead; then put TLS in front of it
+(see the notes) and point clients at that URL, e.g.
+`https://vphone.example.com/mcp`.
 
 Or in a client config file:
 
@@ -113,28 +122,54 @@ Notes:
   Tailscale, nginx), or serve HTTPS directly with `--ssl-certfile`/`--ssl-keyfile`.
   The server prints a warning when it binds a non-loopback address without TLS.
 - `GET /healthz` answers `{"status":"ok"}` without a token, for supervisors and
-  proxy health checks. Nothing else is reachable unauthenticated.
+  proxy health checks. The only other path without a bearer check is
+  `/files/...`, and only while it is enabled: each request there must carry
+  its own signed link (see file access below). With `--no-files`, `/files/...`
+  needs the bearer token like everything else. `--path` may not be `/healthz`
+  or anything under `/files`; the server refuses to start rather than put the
+  MCP endpoint behind the files exemption.
 - `--transport sse` serves the legacy SSE transport (`/sse` + `/messages/`) for
   older clients; both endpoints require the same token.
 - Binding a non-loopback address disables the SDK's DNS-rebinding host allowlist
   (the token is the gate). Pass `--allowed-host vphone.example.com` to turn it
   back on for a known hostname.
+- The server removes `VPHONE_MCP_AUTH_TOKEN` from its own environment once it
+  has read it. vphone-cli, ffmpeg and osascript inherit that environment, and
+  their output comes back in tool results and served launch logs.
 - Paths in tool arguments (e.g. `screenshot(save_path=...)`, `vm_export(out=...)`)
   resolve on the **server** host, not the client's — see file access below.
+- **In network mode, every host-path parameter is reachable by anyone holding
+  the token.** The `/files` endpoint is confined to `$VPHONE_ROOT/vphone-mcp`,
+  but tool arguments are not:
+  - `screenshot(save_path=...)` writes a PNG to any path the server's user can
+    write, overwriting what is there;
+  - `vm_export(out=...)` writes an archive anywhere;
+  - `vm_import(input=...)` reads one from anywhere;
+  - `boot(config=...)` reads any manifest.
+
+  The same goes for the other path-typed arguments: `library_root`,
+  `project_root`, `patch_component`'s `input`/`output`, and `install_ipa` given
+  a path. Treat the token as a shell on the VM host as that user, not as access
+  to the VMs alone.
 
 #### Run it at login (launchd, macOS)
 
 `contrib/launchd/install.sh` installs a LaunchAgent that serves
-`0.0.0.0:8765` at login with one fixed token, and prints the client config:
+`127.0.0.1:8765` at login with one fixed token, and prints the client config
+for this Mac and for another machine over an SSH tunnel:
 
 ```bash
 ./contrib/launchd/install.sh
 ```
 
-The token is generated once into `~/.vphone/mcp-auth-token` (0600) and reused by
-later re-installs, so configured clients keep working; the plist points
-`VPHONE_MCP_AUTH_TOKEN_FILE` at it rather than carrying the value. Host, port,
-public URL and the token itself are overridable from the environment — see
+The token is generated once into `~/.vphone/mcp-auth-token` (0600, written
+under `umask 077`) and reused by later re-installs, so configured clients keep
+working. The plist points `VPHONE_MCP_AUTH_TOKEN_FILE` at it rather than
+carrying the value, and the installer prints the file's path, never the token.
+Remote access goes through an SSH tunnel or Tailscale serve.
+`VPHONE_MCP_HOST=0.0.0.0` opts back into serving the LAN over plain HTTP. Host,
+port, public URL, extra allowed Host names and the token itself are all
+overridable from the environment; see
 [contrib/launchd/README.md](contrib/launchd/README.md).
 
 #### File access
@@ -142,36 +177,48 @@ public URL and the token itself are overridable from the environment — see
 Tools name files on the server's disk: the full-resolution screenshot, the
 launch log, an exported `.vphone` archive. A remote client cannot read any of
 them, so the server also exposes `GET /files/<path>`, where `<path>` is relative
-to a vphone root:
+to a vphone root. Tools hand out short-lived, per-file links to it:
 
 ```
-http://<hash>:<mcp-token>@host:8765/files/screenshots/screen.png
-       └ sha256 of the resolved absolute path
-               └ the same token the MCP endpoint uses
+http://<expires>:<signature>@host:8765/files/screenshots/screen.png
+       │         └ HMAC-SHA256 over (method, canonical path, expires)
+       └ unix time the link stops working (default: minted + 1 hour)
 ```
 
-- `screenshot()` and the background launch tools (`vm_launch`, `boot`) include a
-  URL in their result; `get_file_url(path)` mints one for any other server-side
-  path. `curl -O '<url>'` works as-is — HTTP Basic is used precisely because the
-  credentials fit inside the URL.
-- **No extra secret and no server state.** The Basic password is the MCP token
-  you already configured, and the user is the hash that pins the link to one
-  file. Serving a request means joining the relative path onto the root,
-  normalising it, and answering only when the result stays inside that root
-  **and** hashes to what the request presented. A tampered path — `../`, an
-  absolute path, a different file — resolves elsewhere, so its hash no longer
-  matches and it never reaches the filesystem. Links stay valid across restarts.
+- `screenshot()`, `stop_recording()` and the background launch tools
+  (`vm_launch`, `boot`, `install_ipa`) include a link in their result;
+  `get_file_url(path)` mints one for any other server-side path. `curl -O
+  '<url>'` works as-is. HTTP Basic is used precisely because the credentials fit
+  inside the URL, and because they travel in a header they stay out of access
+  logs.
+- **A link is a capability, not the token.** Links end up in tool results, so in
+  model context and transcripts. Each one therefore authorises one method
+  (GET, or PUT for an upload) on one file until it expires, and nothing else.
+  The signing key is derived from the MCP token: links survive a restart, the
+  token cannot be recovered from them, and rotating the token revokes every
+  outstanding link. A link for one file presented for another, a tampered
+  path (`../`, an absolute path), a GET link used to PUT, or a link past its
+  expiry is a **401**. The signature is checked before the requested path is
+  looked up on disk, so none of these ever gets that far.
+- **Expiry.** `VPHONE_MCP_LINK_TTL_SECONDS` (default `3600`, 1 s to 7 days).
+  An expired link's 401 says so; call `get_file_url` (or `create_upload_url`)
+  again for a fresh one. Nothing is stored server-side, so a link can be reused
+  until it expires, and there is no list of issued links to revoke one by one.
+  The token is the master switch.
 - Exactly one directory is served: `$VPHONE_ROOT/vphone-mcp` (default
-  `~/.vphone/vphone-mcp`), which is this server's own — `logs/` and
-  `screenshots/`. The VM library and the rest of the vphone root stay
-  unreachable, so write anything a client must fetch there (e.g.
-  `vm_export(out=...)`). Each file has exactly one URL: a `..` detour that
-  normalises to the same file is a 404, and paths are resolved before the scope
-  check, so a symlink inside the root pointing outside it is rejected.
+  `~/.vphone/vphone-mcp`), which is this server's own: `logs/`, `screenshots/`,
+  `recordings/` and `uploads/`. The VM library and the rest of the vphone root
+  stay unreachable, so write anything a client must fetch there (e.g.
+  `vm_export(out=...)`). Each file has exactly one URL, the canonical spelling
+  that was signed. Paths are resolved again at request time, so a genuine
+  link whose file has since been swapped for a symlink pointing outside the
+  root is refused (404).
 - Set `VPHONE_MCP_PUBLIC_URL` when the server sits behind a proxy or binds
-  `0.0.0.0`, otherwise the emitted links point at the bind address. Serve the
-  whole thing over TLS: these URLs carry the token.
-- `--no-files` turns the endpoint off entirely.
+  `0.0.0.0`, otherwise the emitted links point at the bind address. Use TLS or
+  a tunnel off-host: a link is a bearer credential for its one file while it
+  lasts.
+- `--no-files` turns the endpoint off entirely; `/files/...` then requires the
+  bearer token like any other path.
 
 #### Installing an IPA from a remote client
 
@@ -182,8 +229,11 @@ host and install it:
 create_upload_url("MyApp.ipa")   → curl -T MyApp.ipa '<url>'   → install_ipa("MyApp.ipa")
 ```
 
-`create_upload_url` mints a PUT URL (same auth as a download) and prints the
-curl line; the body is streamed to `$VPHONE_ROOT/vphone-mcp/uploads/MyApp.ipa`
+`create_upload_url` mints a signed PUT link for that one filename and prints
+the curl line. Like a download link, it expires after
+`VPHONE_MCP_LINK_TTL_SECONDS` (1 hour by default) and can be reused until then.
+A GET link for the same file cannot overwrite it. The body is streamed to
+`$VPHONE_ROOT/vphone-mcp/uploads/MyApp.ipa`
 through a `.part` file, so a truncated transfer never looks like a finished
 IPA. `VPHONE_MCP_MAX_UPLOAD_MB` caps the size (default 4096).
 
@@ -219,8 +269,8 @@ doing after an install, since IPAs are large.
 | `start_recording(name=None, fps=2.0, max_seconds=120, mode="auto")` | Start recording the display (vphone-cli's own recorder, or polling) |
 | `stop_recording()` | Finish the recording; returns path, frame count and a URL |
 | `recording_status()` | Whether a recording is running, and how many frames so far |
-| `get_file_url(path)` | URL for a server-side file, for remote clients (network transport only — see [File access](#file-access)) |
-| `create_upload_url(filename)` | URL a remote client can PUT a file (e.g. an IPA) to (network transport only) |
+| `get_file_url(path)` | Signed, expiring GET link for a server-side file, for remote clients (network transport only — see [File access](#file-access)) |
+| `create_upload_url(filename)` | Signed, expiring PUT link a remote client can upload a file (e.g. an IPA) to (network transport only) |
 | `install_ipa(ipa, name=None, headless=False)` | Boot a VM with an IPA/TIPA installed once the guest channel connects |
 | `list_uploads()` | Staged uploads with size and age |
 | `delete_upload(filename)` | Remove one staged upload |
@@ -388,7 +438,7 @@ Every setting below has a matching CLI flag (`vphone-mcp --help`); flags win ove
 | `VPHONE_MCP_AUTH_TOKEN_FILE` | — | File to read the token from when `VPHONE_MCP_AUTH_TOKEN` is unset (launchd/docker secrets) |
 | `VPHONE_MCP_HOST` | `--host` | Bind address (default `127.0.0.1`; `0.0.0.0` to accept remote clients) |
 | `VPHONE_MCP_PORT` | `--port` | Bind port (default `8765`) |
-| `VPHONE_MCP_PATH` | `--path` | Streamable-HTTP endpoint path (default `/mcp`) |
+| `VPHONE_MCP_PATH` | `--path` | Streamable-HTTP endpoint path (default `/mcp`; `/healthz` and anything under `/files` are refused) |
 | `VPHONE_MCP_ALLOW_ANONYMOUS` | `--allow-anonymous` | Serve without a token — only when something else gates access |
 | `VPHONE_MCP_JSON_RESPONSE` | `--json-response` | Plain JSON replies instead of SSE streams (for SSE-buffering proxies) |
 | `VPHONE_MCP_STATELESS` | `--stateless` | New transport per request — no session affinity, for load-balanced setups |
@@ -397,7 +447,8 @@ Every setting below has a matching CLI flag (`vphone-mcp --help`); flags win ove
 | `VPHONE_MCP_SSL_CERTFILE` | `--ssl-certfile` | TLS certificate for direct HTTPS serving |
 | `VPHONE_MCP_SSL_KEYFILE` | `--ssl-keyfile` | TLS private key for direct HTTPS serving |
 | `VPHONE_MCP_PUBLIC_URL` | `--public-url` | External base URL used to build file links (set it behind a proxy or a wildcard bind) |
-| `VPHONE_MCP_DISABLE_FILES` | `--no-files` | Do not serve `/files/<path>` at all |
+| `VPHONE_MCP_DISABLE_FILES` | `--no-files` | Do not serve `/files/<path>` at all (it then requires the bearer token like any path) |
+| `VPHONE_MCP_LINK_TTL_SECONDS` | — | Lifetime of each signed file link (default `3600`; 1 to 604800). Read for network transports only |
 | `VPHONE_MCP_MAX_UPLOAD_MB` | — | Upload size cap in MB (default 4096; `0` disables the cap) |
 | `VPHONE_MCP_UPLOAD_TTL_HOURS` | — | How long staged uploads are kept (default 3; `0` keeps them until deleted) |
 | `VPHONE_MCP_RECORDING_TTL_HOURS` | — | Prune recordings older than this many hours when a new one starts (default `0` = keep until deleted) |

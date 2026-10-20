@@ -25,10 +25,15 @@
              `launchctl print`. -->
         <key>VPHONE_MCP_AUTH_TOKEN_FILE</key>
         <string>{{TOKEN_FILE}}</string>
-        <!-- Binding 0.0.0.0 means the bind address is not what clients dial,
-             so file links have to be built on this instead. -->
+        <!-- What clients dial, which file links are built on. Behind an SSH
+             tunnel it is the loopback URL; behind Tailscale serve or a proxy,
+             or with a 0.0.0.0 bind, it differs from the bind address. -->
         <key>VPHONE_MCP_PUBLIC_URL</key>
         <string>{{PUBLIC_URL}}</string>
+        <!-- Extra Host header values to accept (e.g. the Tailscale serve
+             name). Empty means the server's default for the bind address. -->
+        <key>VPHONE_MCP_ALLOWED_HOSTS</key>
+        <string>{{ALLOWED_HOSTS}}</string>
         <!-- A launchd agent inherits a minimal PATH, so pin the CLI. -->
         <key>VPHONE_CLI_BIN</key>
         <string>{{CLI_BIN}}</string>

@@ -156,8 +156,8 @@ def screenshot(
     full PNG inline (large — prefer reading the saved file directly instead).
 
     Paths are on the SERVER host. When the server runs a network transport,
-    the result also carries a URL for the saved PNG (see get_file_url), so a
-    remote client can fetch the full-resolution file.
+    the result also carries a short-lived signed URL for the saved PNG (see
+    get_file_url), so a remote client can fetch the full-resolution file.
     """
     path = save_path or str(files.screenshot_dir() / "screen.png")
     Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -187,8 +187,11 @@ def get_file_url(path: str) -> str:
 
     Use this for anything a tool left on disk that the client cannot read
     directly: a saved screenshot, a launch log under
-    $VPHONE_ROOT/vphone-mcp/logs/. The URL carries the path's hash and the MCP
-    token as Basic credentials, so `curl -O <url>` works as-is.
+    $VPHONE_ROOT/vphone-mcp/logs/. The URL carries its own credentials, so
+    `curl -O '<url>'` works as-is. Those credentials are a signature that
+    allows GET on this one file only, never the MCP token. They expire after
+    $VPHONE_MCP_LINK_TTL_SECONDS (default 1 hour); after that, call this tool
+    again for a fresh link.
 
     Only files inside $VPHONE_ROOT/vphone-mcp are served — write anything the
     client has to fetch there (e.g. vm_export(out=...)). Anything else raises,
@@ -300,8 +303,10 @@ def create_upload_url(filename: str) -> str:
 
     The file lands in $VPHONE_ROOT/vphone-mcp/uploads/, the one writable
     directory; uploading the same name again replaces it. The URL carries its
-    own credentials and stays valid while the server runs with the same token.
-    Available only when the server runs a network transport.
+    own credentials: a signature that allows PUT to this one filename only,
+    never the MCP token. It can be reused until it expires
+    ($VPHONE_MCP_LINK_TTL_SECONDS, default 1 hour); after that, call this tool
+    again. Available only when the server runs a network transport.
     """
     if not files.enabled():
         raise RuntimeError(
@@ -310,10 +315,14 @@ def create_upload_url(filename: str) -> str:
         )
     name = files.safe_filename(filename)
     url = files.upload_url(name)
+    ttl = files.link_ttl()
+    valid = f"{ttl // 60} min" if ttl >= 120 else f"{ttl} s"
     return (
         f"curl -T <local-file> '{url}'\n\n"
         f"Stored as {files.upload_dir() / name}. "
-        f'Install it with install_ipa("{name}").'
+        f'Install it with install_ipa("{name}"). '
+        f"The link is valid for {valid}; call create_upload_url again "
+        "after that."
     )
 
 

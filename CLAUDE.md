@@ -6,8 +6,8 @@ MCP server for programmatic control of vphone-cli iOS VMs.
 
 - **Install:** `uv sync`
 - **Run (stdio, default):** `uv run vphone-mcp`
-- **Run (remote):** `VPHONE_MCP_AUTH_TOKEN=... uv run vphone-mcp --transport http --host 0.0.0.0`
-- **Run (remote, always-on):** `./contrib/launchd/install.sh` — LaunchAgent on `0.0.0.0:8765`, fixed token in `~/.vphone/mcp-auth-token` (0600), log at `~/Library/Logs/vphone-mcp.log`
+- **Run (remote):** `VPHONE_MCP_AUTH_TOKEN=... uv run vphone-mcp --transport http` (binds 127.0.0.1; reach it over an SSH tunnel or Tailscale serve, or pass `--host 0.0.0.0` for the LAN)
+- **Run (remote, always-on):** `./contrib/launchd/install.sh` — LaunchAgent on `127.0.0.1:8765`, fixed token in `~/.vphone/mcp-auth-token` (0600, never printed), log at `~/Library/Logs/vphone-mcp.log`
 - **Test:** `uv run python -c "from vphone_mcp.client import VPhoneClient; print(VPhoneClient('/path/to/vm/vphone.sock').screenshot('/tmp/test.png'))"`
 - **Env probe:** `vphone_status` tool reports CLI binary, socket, VM list, and running launches without raising.
 
@@ -48,29 +48,50 @@ network, with the whole ASGI app wrapped in `remote.AuthMiddleware`
 (constant-time compare, `GET /healthz` exempt). A network transport refuses to
 start without `VPHONE_MCP_AUTH_TOKEN` unless `--allow-anonymous` is passed —
 the tools launch VMs and run sudo, so the token is the only gate. The token is
-env-only by design (never argv). Binding a non-loopback host replaces FastMCP's
+env-only by design (never argv). `remote._read_token()` pops it from
+`os.environ`: subprocess output comes back as tool results and served logs,
+so children must never inherit it. Binding a non-loopback host replaces FastMCP's
 import-time localhost DNS-rebinding allowlist, which would otherwise 421 every
-real Host header.
+real Host header. The middleware lets `/files/...` through without a bearer
+check only when `build_app` passes `files_prefix`, i.e. only while the file
+route is registered. `_validate` refuses a `--path` of `/healthz` or under
+`/files` for the same reason: FastMCP adds custom routes *after* the MCP
+route, so an MCP endpoint there would be served unauthenticated.
 
 `vphone_mcp/files.py` makes server-side files fetchable by remote clients over
 `GET /files/<path under files.root()>` (e.g. `/files/screenshots/screen.png`).
-Auth is HTTP Basic (the only scheme that fits inside a URL) but introduces no
-second secret: the password is the MCP token, the user is `sha256(<resolved
-absolute path>)`. Serving is stateless — `files.resolve()` joins the relative
-path onto the root, normalises it, and returns a file only when it stayed
-inside the root, is the spelling `relative_path()` would mint (so each file has
-exactly one URL — a `..` detour is a 404), hashes to the presented user, and is
-a regular file. Traversal, absolute paths and symlinks out of scope therefore
-fail without ever being opened, and links survive a restart. `files.root()` is
-`$VPHONE_ROOT/vphone-mcp` and nothing else is served: the VM library and the
-rest of the vphone root stay unreachable. `files.url_for()` returns None on
-stdio, so tools silently skip the link when it is meaningless.
+Auth is HTTP Basic (the only scheme that fits inside a URL), carrying a signed
+capability instead of the token. Links land in tool results, so in model
+context. The scheme:
+
+- user = expiry (unix seconds);
+- password = `HMAC-SHA256(key, method \0 root/relative \0 expiry)`;
+- `key = HMAC(token, "vphone-mcp file link v1")` (`files._link_key`; random
+  per process under `--allow-anonymous`). The token itself is never stored in
+  the module or put in a link.
+
+`files.check_link()` recomputes the signature from the request's own method
+(HEAD counts as GET), path and expiry before the requested path is looked up
+on disk. Any
+mismatch, a different file, a non-canonical spelling, a GET link used to PUT,
+or expiry raises `LinkError`, which `_file_handler` turns into a 401. String
+compares are on UTF-8 bytes, because `hmac.compare_digest` raises TypeError
+on non-ASCII `str`. Only after that does `files.resolve()` re-check scope:
+the path is resolved, must stay inside the root, must still be the
+`relative_path()` spelling, and must be a regular file; otherwise 404. Serving
+stays stateless: links survive a restart under the same token, expire after
+`$VPHONE_MCP_LINK_TTL_SECONDS` (default 3600, validated 1..7 days at startup),
+and die with a token rotation. `files.root()` is `$VPHONE_ROOT/vphone-mcp` and
+nothing else is served: the VM library and the rest of the vphone root stay
+unreachable. `files.url_for()` returns None on stdio, so tools silently skip
+the link when it is meaningless.
 `cli.run_background()` and `server._guest_network()` take the log directory
 from `files.log_dir()`, so a custom `$VPHONE_ROOT` keeps launch logs in scope.
 
 `files.upload_dir()` (`<root>/uploads`) is the one writable path: the same
-endpoint takes PUT there, verified by `files.upload_target()` (canonical path,
-hash match, parent must be the upload dir, no existence requirement), streamed
+endpoint takes PUT there, verified by `files.upload_target()` (a PUT link for
+exactly that path, which only `files.upload_url()` mints; parent must be the
+upload dir; no existence requirement), streamed
 through a `.part` file and capped by `$VPHONE_MCP_MAX_UPLOAD_MB`. That is how a
 remote client gets an IPA onto the host — `create_upload_url` mints the PUT URL,
 `install_ipa` then runs `boot --config <vm>/config.plist --install-ipa <file>`
@@ -120,7 +141,8 @@ fetchable over the file endpoint and kept until deleted; setting
 - `VPHONE_LIBRARY_ROOT` — VM library root override (default: vphone-cli's `~/.vphone/machines`, then legacy `~/.vphone/VMs`; see `files.library_roots()`)
 - `VPHONE_ROOT` — vphone project root override (default `~/.vphone`)
 - `VPHONE_SUDO_PASSWORD` — sudo password fallback for `vm_create` (keeps it out of agent context)
-- `VPHONE_MCP_AUTH_TOKEN` / `VPHONE_MCP_AUTH_TOKEN_FILE` — bearer token for network transports
+- `VPHONE_MCP_AUTH_TOKEN` / `VPHONE_MCP_AUTH_TOKEN_FILE` — bearer token for network transports (the env var is dropped from the server's environment once read)
+- `VPHONE_MCP_LINK_TTL_SECONDS` — lifetime of signed file links (default 3600, 1..604800; network transports only)
 - `VPHONE_MCP_MAX_UPLOAD_MB` — upload size cap (default 4096, `0` disables)
 - `VPHONE_MCP_UPLOAD_TTL_HOURS` — how long staged uploads are kept (default 3, `0` keeps them)
 - `VPHONE_MCP_RECORDING_TTL_HOURS` — prune recordings older than this many hours (default `0` = keep them)

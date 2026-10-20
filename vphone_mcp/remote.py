@@ -15,12 +15,14 @@ unless ``--allow-anonymous`` is passed explicitly.
 A second endpoint, ``/files/<path under $VPHONE_ROOT/vphone-mcp>``, serves the
 files tools produce (see :mod:`vphone_mcp.files`) to clients that cannot read
 the server's disk, and accepts PUT uploads into ``uploads/`` so a remote client
-can put an IPA on the host. It
-authenticates with HTTP Basic rather than a bearer header — Basic credentials
-ride inside the URL itself, so the emitted link works in curl, a browser or a
-downloader with nothing else configured — but the credentials are not a second
-secret: the password is this same MCP token, and the user is the hash of the
-full path the link was minted for.
+can put an IPA on the host. It authenticates with HTTP Basic rather than a
+bearer header: Basic credentials ride inside the URL itself, so the emitted
+link works in curl, a browser or a downloader with nothing else configured.
+Those credentials are a signed, expiring capability for one method on one
+file (user = expiry, password = HMAC). They are never the MCP token, because
+links are printed into tool results and so into model context. That is the
+one path :class:`AuthMiddleware` lets through without a bearer header, and
+only while the route exists.
 """
 
 import argparse
@@ -71,8 +73,16 @@ def _env_int(name: str, default: int) -> int:
 
 
 def _read_token() -> str:
-    """Token from $VPHONE_MCP_AUTH_TOKEN, else from $VPHONE_MCP_AUTH_TOKEN_FILE."""
-    token = os.environ.get(TOKEN_ENV, "").strip()
+    """Token from $VPHONE_MCP_AUTH_TOKEN, else from $VPHONE_MCP_AUTH_TOKEN_FILE.
+
+    The variable is removed from the environment once read. Every subprocess
+    inherits ``os.environ`` (vphone-cli and the scripts it runs, ffmpeg,
+    osascript), and their output comes back as tool results and launch logs,
+    which are served under ``/files``. The token must not ride along. Only the
+    file *path* stays in the environment: a path is not a secret, and children
+    run as the same user anyway.
+    """
+    token = os.environ.pop(TOKEN_ENV, "").strip()
     if token:
         return token
     path = os.environ.get(TOKEN_FILE_ENV, "").strip()
@@ -102,6 +112,7 @@ class RemoteConfig:
     ssl_keyfile: str = ""
     files_enabled: bool = True
     public_url: str = ""
+    link_ttl: int = files.DEFAULT_LINK_TTL
 
     @property
     def is_network(self) -> bool:
@@ -216,8 +227,9 @@ def _build_parser() -> argparse.ArgumentParser:
 def parse_config(argv: list[str] | None = None) -> RemoteConfig:
     """Resolve the transport config from env vars and CLI flags, or exit."""
     args = _build_parser().parse_args(argv)
+    transport = HTTP if args.transport == "http" else args.transport
     cfg = RemoteConfig(
-        transport=HTTP if args.transport == "http" else args.transport,
+        transport=transport,
         host=args.host,
         port=args.port,
         path=args.path if args.path.startswith("/") else "/" + args.path,
@@ -231,9 +243,34 @@ def parse_config(argv: list[str] | None = None) -> RemoteConfig:
         ssl_keyfile=args.ssl_keyfile,
         files_enabled=not args.no_files,
         public_url=args.public_url,
+        # Read only for network transports, so a stray value can never stop
+        # a stdio server from starting.
+        link_ttl=(
+            _env_int("VPHONE_MCP_LINK_TTL_SECONDS", files.DEFAULT_LINK_TTL)
+            if transport != STDIO
+            else files.DEFAULT_LINK_TTL
+        ),
     )
     _validate(cfg)
     return cfg
+
+
+def _reserved_path(path: str) -> str | None:
+    """Why ``path`` cannot be the MCP endpoint, or None when it can.
+
+    Everything under ``/files/`` skips the bearer check, because those requests
+    carry their own signed credentials. An MCP endpoint there would be served
+    with no authentication at all. ``/healthz`` is answered before routing, so
+    it would make the endpoint unreachable.
+    """
+    if path == files.ROUTE_PREFIX or path.startswith(files.ROUTE_PREFIX + "/"):
+        return (
+            f"{files.ROUTE_PREFIX}/ is the file endpoint, which bypasses "
+            "bearer auth"
+        )
+    if path == HEALTH_PATH:
+        return f"{HEALTH_PATH} is the unauthenticated health check"
+    return None
 
 
 def _validate(cfg: RemoteConfig) -> None:
@@ -251,6 +288,13 @@ def _validate(cfg: RemoteConfig) -> None:
     if bool(cfg.ssl_certfile) != bool(cfg.ssl_keyfile):
         raise SystemExit(
             "vphone-mcp: --ssl-certfile and --ssl-keyfile must be given together"
+        )
+    if reason := _reserved_path(cfg.path):
+        raise SystemExit(f"vphone-mcp: --path {cfg.path} is reserved: {reason}")
+    if not 1 <= cfg.link_ttl <= files.MAX_LINK_TTL:
+        raise SystemExit(
+            "vphone-mcp: VPHONE_MCP_LINK_TTL_SECONDS must be between 1 and "
+            f"{files.MAX_LINK_TTL} (7 days), got {cfg.link_ttl}"
         )
     if cfg.files_enabled and not cfg.public_url and cfg.host in ("0.0.0.0", "::"):
         _warn(
@@ -293,16 +337,27 @@ class AuthMiddleware:
     """ASGI middleware requiring ``Authorization: Bearer <token>``.
 
     It wraps the whole app rather than a single route, so the SSE transport's
-    ``/messages/`` endpoint is covered too. Two paths are handled elsewhere:
-    ``HEALTH_PATH``, so a supervisor or proxy can probe liveness without a
-    credential, and ``/files/...``, which authenticates with Basic because its
-    verification needs the requested path (see :func:`_serve_file`).
+    ``/messages/`` endpoint is covered too. Two paths are handled elsewhere.
+    ``HEALTH_PATH`` is answered here, so a supervisor or proxy can probe
+    liveness without a credential. ``files_prefix`` is handed straight to the
+    app, because a signed file link is checked against the requested path and
+    method (see :func:`_file_handler`). That exemption exists only when the
+    caller passes the prefix, which :func:`build_app` does only once the
+    file route is registered. Without it, ``/files/...`` needs the bearer
+    token like everything else.
     """
 
-    def __init__(self, app, token: str = "", health_path: str = HEALTH_PATH):
+    def __init__(
+        self,
+        app,
+        token: str = "",
+        health_path: str = HEALTH_PATH,
+        files_prefix: str | None = None,
+    ):
         self.app = app
         self._token = token.encode()
         self.health_path = health_path
+        self._files_prefix = files_prefix + "/" if files_prefix else None
 
     async def __call__(self, scope, receive, send) -> None:
         if scope["type"] != "http":  # lifespan / websocket pass straight through
@@ -312,8 +367,8 @@ class AuthMiddleware:
         if path == self.health_path:
             await _send_json(send, 200, {"status": "ok"})
             return
-        if path.startswith(files.ROUTE_PREFIX + "/"):
-            await self.app(scope, receive, send)  # _serve_file authenticates
+        if self._files_prefix and path.startswith(self._files_prefix):
+            await self.app(scope, receive, send)  # _file_handler authenticates
             return
         if not self._bearer_ok(scope):
             await _send_json(
@@ -407,36 +462,44 @@ def _transport_security(cfg: RemoteConfig):
     return TransportSecuritySettings(enable_dns_rebinding_protection=False)
 
 
-def _file_handler(token: str):
-    """Build the ``/files/{path}`` endpoint bound to the MCP token.
+def _file_handler():
+    """Build the ``/files/{path}`` endpoint.
 
-    Authentication is HTTP Basic: the password is the MCP token, and the user
-    is the hash of the full path the link was minted for. Both halves are
-    checked here rather than in :class:`AuthMiddleware` because verifying the
-    hash needs the requested path.
+    Authentication is HTTP Basic carrying a signed link (user = expiry,
+    password = signature; see :mod:`vphone_mcp.files`). It is checked here
+    rather than in :class:`AuthMiddleware` because the signature covers the
+    requested path and method. A bad or expired link is a 401, and so is a
+    link for one file presented for another. Only a genuine link whose file
+    is gone, or has moved out of scope, gets a 404.
     """
 
     async def serve_file(request):
         from starlette.responses import FileResponse, JSONResponse
 
-        credentials = basic_credentials(request.headers.get("authorization", ""))
-        if credentials is None or (
-            token and not hmac.compare_digest(credentials[1], token)
-        ):
+        def unauthorized(description: str):
             return JSONResponse(
-                {
-                    "error": "invalid_credentials",
-                    "error_description": "Basic credentials are required: the "
-                    "path hash as user, the MCP token as password",
-                },
+                {"error": "invalid_credentials", "error_description": description},
                 status_code=401,
                 headers={"WWW-Authenticate": 'Basic realm="vphone-mcp files"'},
             )
+
+        credentials = basic_credentials(request.headers.get("authorization", ""))
+        if credentials is None:
+            return unauthorized(
+                "a signed link is required: use the URL a tool returned "
+                "(get_file_url, screenshot, create_upload_url, ...) as-is"
+            )
+        expires, signature = credentials
+        relative = request.path_params["path"]
+        try:
+            if request.method == "PUT":
+                target = files.upload_target(relative, expires, signature)
+            else:
+                target = files.resolve(relative, expires, signature)
+        except files.LinkError as exc:
+            return unauthorized(str(exc))
         if request.method == "PUT":
-            return await _store_upload(request, credentials[0])
-        # No path leaves this function unverified: resolve() only returns a
-        # file that stayed inside the root and hashes to the presented user.
-        target = files.resolve(request.path_params["path"], credentials[0])
+            return await _store_upload(request, target)
         if target is None:
             return JSONResponse(
                 {"error": "not_found", "error_description": "No such file"},
@@ -453,18 +516,18 @@ class _TooLarge(Exception):
     pass
 
 
-async def _store_upload(request, presented_hash: str):
-    """Write a PUT body to ``uploads/``, streamed and size-capped.
+async def _store_upload(request, target):
+    """Write a PUT body to ``target`` (verified by files.upload_target), streamed
+    and size-capped.
 
-    The target is verified exactly like a download — canonical path, hash match
-    — with the extra rule that only ``uploads/`` is writable. The body lands in
-    a ``.part`` file first and is renamed into place, so a truncated transfer
-    never looks like a complete IPA.
+    ``target`` is None when a genuine PUT link no longer leads into
+    ``uploads/``, the one writable directory. The body lands in a ``.part``
+    file first and is renamed into place, so a truncated transfer never looks
+    like a complete IPA.
     """
     import anyio
     from starlette.responses import JSONResponse
 
-    target = files.upload_target(request.path_params["path"], presented_hash)
     if target is None:
         return JSONResponse(
             {
@@ -550,11 +613,17 @@ def build_app(mcp, cfg: RemoteConfig):
     if cfg.files_enabled:
         mcp.custom_route(
             files.ROUTE_PREFIX + "/{path:path}", methods=["GET", "PUT"]
-        )(_file_handler(cfg.token))
-        files.configure(public_base_url(cfg), cfg.token)
+        )(_file_handler())
+        files.configure(public_base_url(cfg), cfg.token, cfg.link_ttl)
 
     app = mcp.sse_app() if cfg.transport == SSE else mcp.streamable_http_app()
-    return AuthMiddleware(app, token=cfg.token)
+    return AuthMiddleware(
+        app,
+        token=cfg.token,
+        # Exempt from the bearer check only while the route that checks the
+        # signed links is actually there.
+        files_prefix=files.ROUTE_PREFIX if cfg.files_enabled else None,
+    )
 
 
 def run_server(mcp, cfg: RemoteConfig) -> None:
@@ -578,9 +647,9 @@ def run_server(mcp, cfg: RemoteConfig) -> None:
     if cfg.files_enabled:
         print(
             f"vphone-mcp: files on {files.ROUTE_PREFIX}/<path under "
-            f"{files.root()}> (basic auth: path hash as user, MCP token as "
-            "password) — GET links come from screenshot(), the launch tools "
-            f"and get_file_url(); PUT into {files.upload_dir().name}/ via "
+            f"{files.root()}> (signed per-file links, valid "
+            f"{cfg.link_ttl}s) — GET links come from screenshot(), the launch "
+            f"tools and get_file_url(); PUT into {files.upload_dir().name}/ via "
             "create_upload_url()",
             file=sys.stderr,
             flush=True,
