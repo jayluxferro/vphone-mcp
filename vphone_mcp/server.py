@@ -5,7 +5,6 @@ import json
 import os
 import shutil
 import subprocess
-import tempfile
 import time
 from pathlib import Path
 
@@ -31,6 +30,7 @@ from .cli import (
     run_background,
 )
 from .client import VPhoneClient, image_block
+from . import files, menu, recording
 
 mcp = FastMCP("vphone")
 
@@ -138,7 +138,7 @@ def volume_down(*, screen: bool = True, delay: int = 500) -> str | list:
 
 
 # ---------------------------------------------------------------------------
-# Layer 2: Screenshots / clipboard
+# Layer 2: Screenshots / clipboard / files
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
@@ -149,14 +149,23 @@ def screenshot(
 
     Saves the full-resolution PNG to save_path when given (any directory
     the agent chooses, e.g. an evidence folder), otherwise to
-    /tmp/vphone-mcp-screen.png. Returns the socket's compact grayscale
-    preview inline. Set include_full_png=True to also embed the full PNG
-    inline (large — prefer reading the saved file directly instead).
+    <tmp>/vphone-mcp/screen.png — which is overwritten by the next default
+    capture, so pass save_path to keep one. Returns the socket's compact
+    grayscale preview inline. Set include_full_png=True to also embed the
+    full PNG inline (large — prefer reading the saved file directly instead).
+
+    Paths are on the SERVER host. When the server runs a network transport,
+    the result also carries a URL for the saved PNG (see get_file_url), so a
+    remote client can fetch the full-resolution file.
     """
-    path = save_path or os.path.join(tempfile.gettempdir(), "vphone-mcp-screen.png")
+    path = save_path or str(files.screenshot_dir() / "screen.png")
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     resp = _client().screenshot(path)
     _require_ok(resp)
+
+    status = f"saved: {path}"
+    if url := files.url_for(path):
+        status += f"\nurl: {url}"
 
     blocks: list[dict] = []
     if include_full_png:
@@ -168,7 +177,101 @@ def screenshot(
                 "mimeType": "image/png",
             }
         )
-    return blocks + image_block(resp)
+    return [{"type": "text", "text": status}] + blocks + image_block(resp)
+
+
+@mcp.tool()
+def get_file_url(path: str) -> str:
+    """Return a fetchable URL for a file on the server host.
+
+    Use this for anything a tool left on disk that the client cannot read
+    directly: a saved screenshot, a launch log under
+    $VPHONE_ROOT/vphone-mcp/logs/. The URL carries the path's hash and the MCP
+    token as Basic credentials, so `curl -O <url>` works as-is.
+
+    Only files inside $VPHONE_ROOT/vphone-mcp are served — write anything the
+    client has to fetch there (e.g. vm_export(out=...)). Anything else raises,
+    as does a path that does not exist. Available only when the server runs a
+    network transport — on stdio the path is already local to the client.
+    """
+    if not files.enabled():
+        raise RuntimeError(
+            "File serving is not active: this server is running on stdio (the "
+            "path is already local to the client) or was started with --no-files."
+        )
+    if not files.in_scope(path):
+        raise ValueError(files.scope_error(path))
+    if not Path(path).expanduser().exists():
+        raise FileNotFoundError(f"{path} does not exist on the server host")
+    url = files.url_for(path)
+    if url is None:  # pragma: no cover — scope was just checked
+        raise ValueError(files.scope_error(path))
+    return url
+
+
+@mcp.tool()
+def start_recording(
+    name: str | None = None,
+    fps: float = 2.0,
+    max_seconds: int = 120,
+    mode: str = "auto",
+) -> str:
+    """Start recording the VM display to a video file.
+
+    Two mechanisms, picked by `mode`:
+
+    - "native" — vphone-cli's own recorder, clicked through its menu. It
+      encodes from the VM view in-process, so it is far cheaper than polling,
+      but it needs the macOS Accessibility permission and it chooses the frame
+      rate, file name and destination itself (`name`, `fps` and `max_seconds`
+      are ignored).
+    - "poll" — this server captures screenshots and pipes them into ffmpeg. No
+      permission needed. A capture round-trip is ~90ms, so fps must be <= 5;
+      2 is plenty for UI evidence. Without ffmpeg the frames are zipped instead.
+    - "auto" (default) — native, falling back to poll when Accessibility is not
+      granted; the result says which ran and why.
+
+    Interaction tools keep working while it runs — that is the point: record,
+    drive the UI, stop, then fetch the file (stop_recording returns a URL when
+    serving remotely). One recording at a time.
+
+    Args:
+        name: artifact name for poll mode (default: a timestamp)
+        fps: frames per second for poll mode, <= 5
+        max_seconds: poll-mode hard stop so a forgotten recording cannot fill
+            the disk — capture ends there, but the file is only finalised by
+            stop_recording(), which is what returns the artifact
+        mode: "auto", "native" or "poll"
+    """
+    stem = name or time.strftime("rec-%Y%m%d-%H%M%S")
+    for suffix in (".mp4", ".zip"):
+        if stem.lower().endswith(suffix):
+            stem = stem[: -len(suffix)]
+    state = recording.start(_client, stem, fps, max_seconds, mode)
+    return json.dumps(state)
+
+
+@mcp.tool()
+def stop_recording() -> str:
+    """Stop the running recording and return the finished artifact.
+
+    Reports the server-side path plus a URL to fetch the file with when serving
+    remotely; poll mode also reports the frame count and actual frame rate.
+    A native recording stays where vphone-cli saved it and is hard-linked into
+    the served directory, so its "Reveal in Finder" keeps working and no space
+    is used twice. Recordings in the served directory are swept after
+    $VPHONE_MCP_RECORDING_TTL_HOURS (default 24).
+    """
+    result = recording.stop()
+    if result.get("path") and (url := files.url_for(result["path"])):
+        result["url"] = url
+    return json.dumps(result)
+
+
+@mcp.tool()
+def recording_status() -> str:
+    """Report whether a recording is running, with frames captured so far."""
+    return json.dumps(recording.status())
 
 
 @mcp.tool()
@@ -183,6 +286,151 @@ def set_clipboard(
     """
     resp = _client().type_text(text, screen=screen, delay=delay)
     return _text_result(_require_ok(resp), resp)
+
+
+@mcp.tool()
+def create_upload_url(filename: str) -> str:
+    """Mint a URL for uploading a file (typically an IPA) to the server host.
+
+    A remote client has no other way to get a file onto the machine that runs
+    the VMs. Upload with the printed curl command, then pass the same bare
+    filename to install_ipa().
+
+    The file lands in $VPHONE_ROOT/vphone-mcp/uploads/, the one writable
+    directory; uploading the same name again replaces it. The URL carries its
+    own credentials and stays valid while the server runs with the same token.
+    Available only when the server runs a network transport.
+    """
+    if not files.enabled():
+        raise RuntimeError(
+            "File serving is not active: this server is running on stdio (the "
+            "client can write the file directly) or was started with --no-files."
+        )
+    name = files.safe_filename(filename)
+    url = files.upload_url(name)
+    return (
+        f"curl -T <local-file> '{url}'\n\n"
+        f"Stored as {files.upload_dir() / name}. "
+        f'Install it with install_ipa("{name}").'
+    )
+
+
+@mcp.tool()
+def list_uploads() -> str:
+    """List the files staged in the upload directory, with size and age.
+
+    Uploads are staging, not storage: anything older than
+    $VPHONE_MCP_UPLOAD_TTL_HOURS (default 3) is swept here and before each new
+    upload, and delete_upload() removes one immediately. Age is read from the
+    filesystem, so this listing is always what is really there.
+    """
+    files.prune_uploads()
+    staged = files.list_uploads()
+    if not staged:
+        return f"no staged uploads in {files.upload_dir()}"
+    now = time.time()
+    lines = [f"{files.upload_dir()}:"]
+    for entry in staged:
+        try:
+            stat = entry.stat()
+        except OSError:
+            continue
+        hours = (now - stat.st_mtime) / 3600
+        age = f"{hours:.1f}h" if hours < 48 else f"{hours / 24:.1f}d"
+        lines.append(f"  {entry.name}  {stat.st_size / 1e6:.1f} MB  {age} old")
+    ttl_hours = files.upload_ttl_seconds() // 3600
+    lines.append(
+        f"TTL: {ttl_hours}h (by mtime), swept here and on the next upload"
+        if ttl_hours
+        else "TTL: disabled — uploads are kept until deleted"
+    )
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def delete_upload(filename: str) -> str:
+    """Delete one staged upload by name.
+
+    Only the upload directory is touched; use it to reclaim space after an
+    install instead of waiting for the TTL sweep.
+    """
+    return f"deleted {files.delete_upload(filename)}"
+
+
+def _library_root() -> Path:
+    return Path(
+        os.environ.get("VPHONE_LIBRARY_ROOT") or Path.home() / ".vphone" / "VMs"
+    ).expanduser()
+
+
+def _vm_manifest(name: str | None) -> Path:
+    """The config.plist of the named VM, or of the only one in the library."""
+    library = _library_root()
+    if name:
+        manifest = library / name / "config.plist"
+        if not manifest.is_file():
+            raise FileNotFoundError(f"no VM manifest at {manifest}")
+        return manifest
+    candidates = sorted(library.glob("*/config.plist"))
+    if not candidates:
+        raise FileNotFoundError(
+            f"no VM bundles under {library} — create one with vm_create"
+        )
+    if len(candidates) > 1:
+        names = ", ".join(p.parent.name for p in candidates)
+        raise ValueError(f"several VMs under {library} ({names}) — pass name=")
+    return candidates[0]
+
+
+@mcp.tool()
+def install_ipa(
+    ipa: str,
+    name: str | None = None,
+    *,
+    headless: bool = False,
+    variant: str | None = None,
+) -> str:
+    """Boot a VM with an IPA/TIPA installed once the guest channel connects.
+
+    Args:
+        ipa: a bare filename uploaded through create_upload_url (resolved in
+            $VPHONE_ROOT/vphone-mcp/uploads/), or a path on the server host
+        name: VM name in the library; omit when the library holds exactly one
+        headless: boot without a VM window
+        variant: firmware variant (less|regular|dev|jb|exp)
+
+    vphone-cli can only install at boot (`boot --install-ipa`), so this BOOTS
+    the VM — there is no install-into-a-running-VM path. Stop a running VM with
+    vm_stop first; this refuses while one is up. Runs detached like vm_launch
+    and returns {"started": pid, "log": path, "log_url": ...}.
+    """
+    candidate = Path(ipa).expanduser()
+    if candidate.name == ipa:  # bare filename → the upload directory
+        candidate = files.upload_dir() / files.safe_filename(ipa)
+    candidate = candidate.resolve()
+    if candidate.suffix.lower() not in (".ipa", ".tipa"):
+        raise ValueError(f"{candidate} is not an .ipa/.tipa file")
+    if not candidate.is_file():
+        raise FileNotFoundError(
+            f"{candidate} does not exist on the server host — upload it first "
+            "with create_upload_url()"
+        )
+    manifest = _vm_manifest(name)
+    if pids := _running_launch_pids():
+        raise RuntimeError(
+            "a vphone-cli VM process is already running (pid "
+            + ", ".join(str(p) for p in pids)
+            + ") — installing an IPA boots the VM, so stop it with vm_stop first"
+        )
+    return _background_result(
+        run_background(
+            "boot",
+            config=str(manifest),
+            install_ipa=str(candidate),
+            headless=headless,
+            variant=variant,
+        )
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -403,7 +651,7 @@ def _guest_network() -> str:
     # 2) Historical candidates: per-VM newest launch logs (the serial
     #    prints the DHCP address sometimes; the log stem is the VM name).
     try:
-        log_dir = Path.home() / ".vphone" / "vphone-mcp" / "logs"
+        log_dir = files.log_dir()
         by_stem: dict[str, list[Path]] = {}
         for p in log_dir.glob("*_launch_*.log"):
             stem = p.name.split("_launch_")[0]
@@ -507,6 +755,20 @@ def vphone_status() -> str:
     except RuntimeError as exc:
         lines.append(f"`vm list --json`: failed — {exc}")
 
+    # accessibility — native recording drives vphone-cli's own menu, and the
+    # permission is granted to whichever process asks, so this has to be
+    # reported from inside the server, not from a developer's terminal.
+    access = menu.accessibility_status()
+    lines.append(
+        "accessibility (native recording): "
+        + (
+            "granted"
+            if access["granted"]
+            else f"DENIED — {access['detail']} "
+            "[start_recording(mode='poll') works without it]"
+        )
+    )
+
     # guest network (arp + per-VM logs, liveness-gated, fingerprint-identified)
     lines.append("guest network:")
     lines.append(_guest_network())
@@ -529,6 +791,14 @@ def vphone_status() -> str:
 # Tools are generated with real signatures (no **kwargs) because FastMCP
 # introspects the function signature to build its schema. exec-based function
 # generation is standard for this pattern and keeps the registry data-driven.
+
+def _background_result(res: dict) -> str:
+    """JSON for a detached launch, plus a fetchable log URL when serving remotely."""
+    payload = {"started": res["pid"], "log": res["log_path"], "argv": res["argv"]}
+    if url := files.url_for(res["log_path"]):
+        payload["log_url"] = url
+    return json.dumps(payload)
+
 
 def _spec_kind(spec: dict) -> str:
     for kind in ("flag", "option", "option_multi", "positional"):
@@ -632,10 +902,7 @@ def _register_cli_tools() -> None:
             body.append(
                 f"        _res = run_background({cmd_key!r}, {', '.join(call_parts)})"
             )
-            body.append(
-                '        return json.dumps({"started": _res["pid"], '
-                '"log": _res["log_path"], "argv": _res["argv"]})'
-            )
+            body.append("        return _background_result(_res)")
             body.append(
                 f"    return format_result(run({cmd_key!r}, {', '.join(call_parts)}))"
             )
@@ -644,10 +911,7 @@ def _register_cli_tools() -> None:
             body.append(
                 f"    _res = run_background({cmd_key!r}, {', '.join(call_parts)})"
             )
-            body.append(
-                '    return json.dumps({"started": _res["pid"], '
-                '"log": _res["log_path"], "argv": _res["argv"]})'
-            )
+            body.append("    return _background_result(_res)")
         else:
             body.append(
                 f"    return format_result(run({cmd_key!r}, {', '.join(call_parts)}))"
@@ -658,6 +922,7 @@ def _register_cli_tools() -> None:
             "run": run,
             "run_background": run_background,
             "format_result": format_result,
+            "_background_result": _background_result,
             "json": json,
             "os": os,
         }
@@ -676,7 +941,15 @@ _register_cli_tools()
 # ---------------------------------------------------------------------------
 
 def main():
-    mcp.run(transport="stdio")
+    """Serve the tools over stdio (default) or a remote HTTP transport.
+
+    Transport, bind address and the bearer token come from the environment
+    (and optional CLI flags) — see :mod:`vphone_mcp.remote`. Imported lazily so
+    a stdio launch never pays for starlette/uvicorn.
+    """
+    from .remote import parse_config, run_server
+
+    run_server(mcp, parse_config())
 
 
 if __name__ == "__main__":

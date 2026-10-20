@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{{LABEL}}</string>
+
+    <!-- The venv console script has an absolute shebang, so launchd needs
+         neither PATH nor a shell to start it. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>{{EXEC}}</string>
+        <string>--transport</string>
+        <string>streamable-http</string>
+        <string>--host</string>
+        <string>{{HOST}}</string>
+        <string>--port</string>
+        <string>{{PORT}}</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- The token is read from a 0600 file, never from argv and never
+             from this plist: launchd job environments are readable with
+             `launchctl print`. -->
+        <key>VPHONE_MCP_AUTH_TOKEN_FILE</key>
+        <string>{{TOKEN_FILE}}</string>
+        <!-- Binding 0.0.0.0 means the bind address is not what clients dial,
+             so file links have to be built on this instead. -->
+        <key>VPHONE_MCP_PUBLIC_URL</key>
+        <string>{{PUBLIC_URL}}</string>
+        <!-- A launchd agent inherits a minimal PATH, so pin the CLI. -->
+        <key>VPHONE_CLI_BIN</key>
+        <string>{{CLI_BIN}}</string>
+        <key>PATH</key>
+        <string>{{PATH_VALUE}}</string>
+        <key>HOME</key>
+        <string>{{HOME_DIR}}</string>
+    </dict>
+
+    <key>WorkingDirectory</key>
+    <string>{{WORKDIR}}</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <!-- Restart on crash or on a config error exit; `launchctl bootout` is
+         the way to stop it for good. -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+    <key>ProcessType</key>
+    <string>Interactive</string>
+
+    <key>StandardOutPath</key>
+    <string>{{LOG_PATH}}</string>
+    <key>StandardErrorPath</key>
+    <string>{{LOG_PATH}}</string>
+</dict>
+</plist>

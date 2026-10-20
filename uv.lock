@@ -2,6 +2,10 @@ version = 1
 revision = 3
 requires-python = ">=3.10"
 
+[options]
+exclude-newer = "0001-01-01T00:00:00Z" # This has no effect and is included for backwards compatibility when using relative exclude-newer values.
+exclude-newer-span = "PT24H"
+
 [[package]]
 name = "annotated-doc"
 version = "0.0.4"
@@ -823,7 +827,11 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "mcp", extra = ["cli"] },
+    { name = "uvicorn" },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "mcp", extras = ["cli"], specifier = ">=1.2.0" }]
+requires-dist = [
+    { name = "mcp", extras = ["cli"], specifier = ">=1.2.0" },
+    { name = "uvicorn", specifier = ">=0.30" },
+]

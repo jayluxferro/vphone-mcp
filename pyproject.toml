@@ -5,6 +5,8 @@ description = "MCP server for programmatic control of vphone-cli iOS VMs"
 requires-python = ">=3.10"
 dependencies = [
     "mcp[cli]>=1.2.0",
+    # imported directly by vphone_mcp.remote to serve the HTTP transports
+    "uvicorn>=0.30",
 ]
 
 [build-system]

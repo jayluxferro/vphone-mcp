@@ -17,6 +17,8 @@ import tempfile
 import time
 from pathlib import Path
 
+from . import files
+
 
 # ---------------------------------------------------------------------------
 # Binary resolution (fail loudly)
@@ -725,7 +727,8 @@ def run_background(cmd_key: str, **params) -> dict:
 
     Only entries declared with ``background: True`` are accepted. The child is
     started in its own session (survives the MCP server) with stdout+stderr
-    streamed to ``~/.vphone/vphone-mcp/logs/<name-or-cmd>_launch_<epoch>.log``.
+    streamed to ``$VPHONE_ROOT/vphone-mcp/logs/<name-or-cmd>_launch_<epoch>.log``
+    (a file-endpoint root, so the log is fetchable remotely).
     Returns ``{"pid", "log_path", "argv"}``.
     """
     entry = _entry(cmd_key)
@@ -734,7 +737,7 @@ def run_background(cmd_key: str, **params) -> dict:
     argv = _build_argv(entry, params)
     name = params.get("name")
     stem = str(name) if name else cmd_key
-    log_dir = Path.home() / ".vphone" / "vphone-mcp" / "logs"
+    log_dir = files.log_dir()
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"{stem}_launch_{int(time.time())}.log"
     env = os.environ.copy()
