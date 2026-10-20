@@ -166,7 +166,13 @@ class Recorder:
                 self._proc.wait(timeout=120)
             except (OSError, subprocess.TimeoutExpired):
                 self._proc.kill()
-            if self._proc.returncode not in (0, None) or not self.out_path.is_file():
+                try:
+                    self._proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+            # A killed (or still unreaped, None) encoder leaves a truncated
+            # file behind; only a clean exit 0 is a finished artifact.
+            if self._proc.returncode != 0 or not self.out_path.is_file():
                 tail = ""
                 try:
                     tail = self._log_path.read_text(errors="ignore").strip()[-300:]
@@ -230,7 +236,7 @@ def search_dirs() -> list[Path]:
             str(home / "Downloads"),
             str(home / "Pictures"),
             str(files.vphone_root()),
-            os.environ.get("VPHONE_LIBRARY_ROOT") or str(home / ".vphone" / "VMs"),
+            *(str(lib) for lib in files.library_roots()),
             tempfile.gettempdir(),
         ]
     found: list[Path] = []

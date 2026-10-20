@@ -105,6 +105,35 @@ def accessibility_status() -> dict:
     }
 
 
+def accessibility_trusted() -> dict:
+    """Whether this process holds the Accessibility permission. Never raises,
+    never prompts — safe for status probes.
+
+    ``AXIsProcessTrusted()`` reads the TCC decision for this process's
+    responsible app (the same one the osascript children inherit) without
+    sending an Apple Event. :func:`accessibility_status` asks System Events
+    instead, which can pop the "wants to control System Events" consent dialog
+    and stall for up to the osascript timeout while it waits. The trade-off:
+    this cannot see that separate Automation consent, which native recording
+    requests on first use.
+    """
+    try:
+        import ctypes
+
+        lib = ctypes.cdll.LoadLibrary(
+            "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices"
+        )
+        lib.AXIsProcessTrusted.restype = ctypes.c_bool
+        trusted = bool(lib.AXIsProcessTrusted())
+    except (OSError, AttributeError) as exc:  # not macOS / symbol missing
+        return {"granted": False, "denied": False, "detail": f"cannot check: {exc}"[:200]}
+    return {
+        "granted": trusted,
+        "denied": not trusted,
+        "detail": "" if trusted else "AXIsProcessTrusted() is false for this process",
+    }
+
+
 def app_running() -> bool:
     script = (
         'tell application "System Events" to return (exists process '

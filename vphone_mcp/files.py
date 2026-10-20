@@ -62,15 +62,32 @@ def log_dir() -> Path:
     return root() / "logs"
 
 
+def library_roots() -> list[Path]:
+    """VM library roots to search, most specific first.
+
+    ``$VPHONE_LIBRARY_ROOT`` when set; otherwise vphone-cli's own default,
+    ``~/.vphone/machines`` (``vm launch --help`` in 2.6.0), followed by the
+    legacy ``~/.vphone/VMs`` that older releases used. Bundles are
+    ``<root>/<name>/`` holding ``config.plist`` and, while running, ``vphone.sock``.
+    """
+    if env := os.environ.get("VPHONE_LIBRARY_ROOT"):
+        return [Path(env).expanduser()]
+    base = Path.home() / ".vphone"
+    return [base / "machines", base / "VMs"]
+
+
 def recording_dir() -> Path:
     """Where finished screen recordings land."""
     return root() / "recordings"
 
 
 def recording_ttl_seconds() -> int:
-    """How long a recording is kept (``$VPHONE_MCP_RECORDING_TTL_HOURS``,
-    default 24); 0 keeps them until something deletes them."""
-    return _ttl_env("VPHONE_MCP_RECORDING_TTL_HOURS", 24)
+    """How long a recording is kept (``$VPHONE_MCP_RECORDING_TTL_HOURS``).
+
+    Default 0 — keep them until something deletes them: a recording is usually
+    evidence, so sweeping it is opt-in rather than a surprise a day later.
+    """
+    return _ttl_env("VPHONE_MCP_RECORDING_TTL_HOURS", 0)
 
 
 def upload_dir() -> Path:

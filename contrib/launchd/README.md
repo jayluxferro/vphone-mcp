@@ -21,7 +21,7 @@ The installer prints the token and a ready-to-paste `claude mcp add` line.
 | Endpoints | `/mcp` (bearer), `/files/<path>` (basic), `/healthz` (open) |
 
 A **user agent, not a system daemon**: the tools talk to the hostctl socket
-under `~/.vphone/VMs` and drive a VM owned by your login session, so the server
+under `~/.vphone/machines` and drive a VM owned by your login session, so the server
 has to be you. It starts when you log in, not at boot.
 
 ## The fixed token

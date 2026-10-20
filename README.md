@@ -156,7 +156,7 @@ http://<hash>:<mcp-token>@host:8765/files/screenshots/screen.png
   credentials fit inside the URL.
 - **No extra secret and no server state.** The Basic password is the MCP token
   you already configured, and the user is the hash that pins the link to one
-  file. Serving a request means joining the relative path onto each root,
+  file. Serving a request means joining the relative path onto the root,
   normalising it, and answering only when the result stays inside that root
   **and** hashes to what the request presented. A tampered path — `../`, an
   absolute path, a different file — resolves elsewhere, so its hash no longer
@@ -282,8 +282,8 @@ exactly one artifact (much larger: a 6-frame zip is ~19 MB where a 13-frame
 H.264 file is ~0.5 MB).
 
 Either way `stop_recording()` returns the server-side path and a URL to fetch it
-with, and recordings in the served directory are swept after
-`VPHONE_MCP_RECORDING_TTL_HOURS` (default 24). One recording at a time.
+with. Recordings are kept until deleted; set `VPHONE_MCP_RECORDING_TTL_HOURS`
+to sweep older ones whenever a new recording starts. One recording at a time.
 
 ### Raw Interaction
 | Tool | Description |
@@ -348,7 +348,7 @@ Claude: [calls open_app("Settings")]
 |---------|-------------|
 | `VPHONE_SOCK` | Path to `vphone.sock` (auto-discovered if not set) |
 | `VPHONE_CLI_BIN` | Path to the vphone-cli binary (default: PATH lookup, then /Applications/vphone-cli.app) |
-| `VPHONE_LIBRARY_ROOT` | VM library root override (default `~/.vphone/VMs`) |
+| `VPHONE_LIBRARY_ROOT` | VM library root override (default: vphone-cli's `~/.vphone/machines`, then legacy `~/.vphone/VMs`) |
 | `VPHONE_ROOT` | vphone project root override (default `~/.vphone`) |
 | `VPHONE_SUDO_PASSWORD` | sudo password fallback for `vm_create` — keeps it out of agent transcripts |
 
@@ -375,7 +375,7 @@ Every setting below has a matching CLI flag (`vphone-mcp --help`); flags win ove
 | `VPHONE_MCP_DISABLE_FILES` | `--no-files` | Do not serve `/files/<path>` at all |
 | `VPHONE_MCP_MAX_UPLOAD_MB` | — | Upload size cap in MB (default 4096; `0` disables the cap) |
 | `VPHONE_MCP_UPLOAD_TTL_HOURS` | — | How long staged uploads are kept (default 3; `0` keeps them until deleted) |
-| `VPHONE_MCP_RECORDING_TTL_HOURS` | — | How long recordings are kept (default 24; `0` keeps them until deleted) |
+| `VPHONE_MCP_RECORDING_TTL_HOURS` | — | Prune recordings older than this many hours when a new one starts (default `0` = keep until deleted) |
 | `VPHONE_MCP_FFMPEG_BIN` | — | ffmpeg binary override for poll mode (default: PATH lookup; without it recordings are zipped PNG frames) |
 | `VPHONE_MCP_APP_PROCESS` | — | vphone-cli's UI process name for menu driving (default `vphone-cli`) |
 | `VPHONE_MCP_RECORD_MENU_KEYWORDS` | — | Comma-separated words matching the recording menu item (default `record`) |

@@ -105,20 +105,21 @@ block while being fed. Without ffmpeg the frames are kept and zipped at stop.
 `max_seconds` ends capture but `stop_recording()` is what finalises the file.
 
 One recording at a time (module lock). Output in `files.recording_dir()` is
-fetchable over the file endpoint and pruned by
-`$VPHONE_MCP_RECORDING_TTL_HOURS` (default 24) when a new recording starts.
+fetchable over the file endpoint and kept until deleted; setting
+`$VPHONE_MCP_RECORDING_TTL_HOURS` prunes older ones when a new recording starts
+(off by default — recordings are usually evidence).
 
 ## Configuration
 
 - `VPHONE_SOCK` — explicit hostctl socket path (auto-discovered from the VM library otherwise)
 - `VPHONE_CLI_BIN` — vphone-cli binary override (default: PATH lookup, then the app bundle)
-- `VPHONE_LIBRARY_ROOT` — VM library root override (default `~/.vphone/VMs`)
+- `VPHONE_LIBRARY_ROOT` — VM library root override (default: vphone-cli's `~/.vphone/machines`, then legacy `~/.vphone/VMs`; see `files.library_roots()`)
 - `VPHONE_ROOT` — vphone project root override (default `~/.vphone`)
 - `VPHONE_SUDO_PASSWORD` — sudo password fallback for `vm_create` (keeps it out of agent context)
 - `VPHONE_MCP_AUTH_TOKEN` / `VPHONE_MCP_AUTH_TOKEN_FILE` — bearer token for network transports
 - `VPHONE_MCP_MAX_UPLOAD_MB` — upload size cap (default 4096, `0` disables)
 - `VPHONE_MCP_UPLOAD_TTL_HOURS` — how long staged uploads are kept (default 3, `0` keeps them)
-- `VPHONE_MCP_RECORDING_TTL_HOURS` — how long recordings are kept (default 24, `0` keeps them)
+- `VPHONE_MCP_RECORDING_TTL_HOURS` — prune recordings older than this many hours (default `0` = keep them)
 - `VPHONE_MCP_FFMPEG_BIN` — ffmpeg override for poll mode (default: PATH; absent → zipped PNG frames)
 - `VPHONE_MCP_APP_PROCESS`, `VPHONE_MCP_RECORD_MENU_KEYWORDS`, `VPHONE_MCP_RECORDING_SEARCH_DIRS` — native-mode menu driving and artifact discovery
 - `VPHONE_MCP_TRANSPORT`, `_HOST`, `_PORT`, `_PATH`, `_ALLOW_ANONYMOUS`, `_JSON_RESPONSE`, `_STATELESS`, `_ALLOWED_HOSTS`, `_ALLOWED_ORIGINS`, `_SSL_CERTFILE`, `_SSL_KEYFILE`, `_PUBLIC_URL`, `_DISABLE_FILES` — transport settings, each with a matching CLI flag (`vphone-mcp --help`)

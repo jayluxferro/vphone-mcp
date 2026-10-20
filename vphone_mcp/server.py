@@ -50,19 +50,20 @@ def _socket_path() -> str:
     """Resolve the vphone.sock hostctl socket path.
 
     Priority: $VPHONE_SOCK env var > first existing <vmlib>/<name>/vphone.sock
-    where vmlib = $VPHONE_LIBRARY_ROOT or ~/.vphone/VMs (glob */vphone.sock,
-    sorted) > $VPHONE_ROOT/VMs/*/vphone.sock (when $VPHONE_ROOT is set) >
-    legacy development paths. Falls back to a default path that produces the
-    existing clean "socket not found" error when nothing exists.
+    where vmlib is each of files.library_roots() — $VPHONE_LIBRARY_ROOT, else
+    vphone-cli's default ~/.vphone/machines then the legacy ~/.vphone/VMs
+    (glob */vphone.sock, sorted) > $VPHONE_ROOT/{machines,VMs}/*/vphone.sock
+    (when $VPHONE_ROOT is set) > legacy development paths. Falls back to a
+    default path that produces the existing clean "socket not found" error
+    when nothing exists.
     """
     if env := os.environ.get("VPHONE_SOCK"):
         return env
-    vmlib = os.environ.get("VPHONE_LIBRARY_ROOT") or str(
-        Path.home() / ".vphone" / "VMs"
-    )
-    candidates = _glob_vphone_socks(vmlib)
+    libraries = files.library_roots()
+    candidates = [s for lib in libraries for s in _glob_vphone_socks(str(lib))]
     if root := os.environ.get("VPHONE_ROOT"):
-        candidates += _glob_vphone_socks(str(Path(root) / "VMs"))
+        for sub in ("machines", "VMs"):
+            candidates += _glob_vphone_socks(str(Path(root) / sub))
     candidates += [
         str(Path.home() / "localdev" / "experiments" / "vphone-cli" / "vm" / "vphone.sock"),
         str(Path.cwd() / "vm" / "vphone.sock"),
@@ -70,7 +71,7 @@ def _socket_path() -> str:
     for candidate in candidates:
         if Path(candidate).exists():
             return candidate
-    return str(Path.home() / ".vphone" / "VMs" / "vphone.sock")
+    return str(libraries[0] / "vphone.sock")
 
 
 def _client() -> VPhoneClient:
@@ -149,7 +150,7 @@ def screenshot(
 
     Saves the full-resolution PNG to save_path when given (any directory
     the agent chooses, e.g. an evidence folder), otherwise to
-    <tmp>/vphone-mcp/screen.png — which is overwritten by the next default
+    $VPHONE_ROOT/vphone-mcp/screenshots/screen.png — which is overwritten by the next default
     capture, so pass save_path to keep one. Returns the socket's compact
     grayscale preview inline. Set include_full_png=True to also embed the
     full PNG inline (large — prefer reading the saved file directly instead).
@@ -259,8 +260,9 @@ def stop_recording() -> str:
     remotely; poll mode also reports the frame count and actual frame rate.
     A native recording stays where vphone-cli saved it and is hard-linked into
     the served directory, so its "Reveal in Finder" keeps working and no space
-    is used twice. Recordings in the served directory are swept after
-    $VPHONE_MCP_RECORDING_TTL_HOURS (default 24).
+    is used twice. Recordings are kept until deleted unless
+    $VPHONE_MCP_RECORDING_TTL_HOURS is set, which sweeps older ones whenever a
+    new recording starts.
     """
     result = recording.stop()
     if result.get("path") and (url := files.url_for(result["path"])):
@@ -357,28 +359,29 @@ def delete_upload(filename: str) -> str:
     return f"deleted {files.delete_upload(filename)}"
 
 
-def _library_root() -> Path:
-    return Path(
-        os.environ.get("VPHONE_LIBRARY_ROOT") or Path.home() / ".vphone" / "VMs"
-    ).expanduser()
-
-
 def _vm_manifest(name: str | None) -> Path:
     """The config.plist of the named VM, or of the only one in the library."""
-    library = _library_root()
+    libraries = files.library_roots()
+    searched = ", ".join(str(lib) for lib in libraries)
     if name:
-        manifest = library / name / "config.plist"
-        if not manifest.is_file():
-            raise FileNotFoundError(f"no VM manifest at {manifest}")
-        return manifest
-    candidates = sorted(library.glob("*/config.plist"))
+        for library in libraries:
+            manifest = library / name / "config.plist"
+            if manifest.is_file():
+                return manifest
+        raise FileNotFoundError(f"no VM manifest for {name!r} under {searched}")
+    candidates: list[Path] = []
+    for library in libraries:
+        try:
+            candidates += sorted(library.glob("*/config.plist"))
+        except OSError:
+            continue
     if not candidates:
         raise FileNotFoundError(
-            f"no VM bundles under {library} — create one with vm_create"
+            f"no VM bundles under {searched} — create one with vm_create"
         )
     if len(candidates) > 1:
         names = ", ".join(p.parent.name for p in candidates)
-        raise ValueError(f"several VMs under {library} ({names}) — pass name=")
+        raise ValueError(f"several VMs under {searched} ({names}) — pass name=")
     return candidates[0]
 
 
@@ -758,16 +761,18 @@ def vphone_status() -> str:
     # accessibility — native recording drives vphone-cli's own menu, and the
     # permission is granted to whichever process asks, so this has to be
     # reported from inside the server, not from a developer's terminal.
-    access = menu.accessibility_status()
-    lines.append(
-        "accessibility (native recording): "
-        + (
-            "granted"
-            if access["granted"]
-            else f"DENIED — {access['detail']} "
+    # accessibility_trusted() never sends an Apple Event: a status probe must
+    # not pop a consent dialog or stall on one. (contrib/launchd/install.sh
+    # greps this line and treats any "granted" in it as granted.)
+    access = menu.accessibility_trusted()
+    if access["granted"]:
+        verdict = "granted"
+    else:
+        verdict = (
+            f"{'DENIED' if access['denied'] else 'unknown'} — {access['detail']} "
             "[start_recording(mode='poll') works without it]"
         )
-    )
+    lines.append(f"accessibility (native recording): {verdict}")
 
     # guest network (arp + per-VM logs, liveness-gated, fingerprint-identified)
     lines.append("guest network:")
