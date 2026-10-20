@@ -7,11 +7,12 @@ file, and ``format_result`` turns a result dict into a human-readable summary.
 
 The CLI surface here was verified against vphone-cli 2.6.0 (`vphone-cli help`,
 live runs, and the upstream Swift source): subcommand names, flags, and the
-``vm list --json`` smoke test all match. Patch selection moved from per-command
-``--variant``/``--frida``/``--force-exc-guard`` flags to ``--preset`` (see
-``fw patches``), and privileged commands (``cfw install``, ``vm create``) are
-now run under ``sudo`` themselves — the CLI's ``--sudo-password`` /
-``--root-popup`` self-elevation flags are gone.
+``vm list --json`` smoke test all match. Patch selection moved from the
+per-command ``--variant``/``--force-exc-guard`` flags to ``--preset`` (see
+``fw patches``; ``patch-component`` still takes its own ``--frida``), and
+privileged commands (``cfw install``, ``vm create``) are now run under
+``sudo`` themselves — the CLI's ``--sudo-password`` / ``--root-popup``
+self-elevation flags are gone.
 """
 
 import json
@@ -94,7 +95,9 @@ def selected_version() -> str | None:
 
 def select_version(version: str) -> None:
     """Persist the active version selection (``vphone-mcp select``)."""
-    _write_config({"vphone_cli_version": version})
+    cfg = _read_config()
+    cfg["vphone_cli_version"] = version
+    _write_config(cfg)
 
 
 def resolve_cli_bin() -> str:
@@ -117,6 +120,8 @@ def resolve_cli_bin() -> str:
         raise RuntimeError(f"VPHONE_CLI_BIN is set but not an executable file: {env_bin}")
     version = selected_version()
     if version:
+        if not re.fullmatch(r"\d+(?:\.\d+)+", version):
+            raise RuntimeError(f"invalid vphone-cli version {version!r}")
         candidate = bundle_bin(version)
         if candidate.is_file() and os.access(candidate, os.X_OK):
             return str(candidate)
@@ -643,6 +648,11 @@ def _build_argv(entry: dict, params: dict) -> list[str]:
     mis-invoke the CLI). Raises RuntimeError if the binary cannot be resolved.
     """
     argv: list[str] = [resolve_cli_bin(), *entry["argv"]]
+    unknown = set(params) - set(entry["options"])
+    if unknown:
+        raise ValueError(
+            f"unknown param(s) {sorted(unknown)!r} for {entry['argv']!r}"
+        )
     positionals: list[str] = []
     for pname, spec in entry["options"].items():
         kind = _spec_kind(spec)
@@ -678,11 +688,13 @@ def _build_argv(entry: dict, params: dict) -> list[str]:
         elif kind == "option_multi":
             if value is None:
                 value = spec.get("default", 0)
-            n = _coerce(spec, pname, value)
-            if int(n) < 0:
+            n = int(_coerce(spec, pname, value))
+            if n < 0:
                 raise ValueError(f"param {pname!r} must be >= 0")
+            if n > 10:
+                raise ValueError(f"param {pname!r} must be <= 10 (got {n})")
             # The repeatable flag string is the value of the option_multi key.
-            argv.extend([spec["option_multi"]] * int(n))
+            argv.extend([spec["option_multi"]] * n)
     # Positionals go last; Swift ArgumentParser consumes flags and positionals
     # in any order, and positionals keep their registry order (e.g. old new).
     argv.extend(positionals)
@@ -699,15 +711,16 @@ def _sudo_prefix() -> tuple[list[str], dict, str | None]:
     vphone-cli 2.6.0 dropped --sudo-password/--root-popup; privileged commands
     (``cfw install``, ``vm create``) must be run under sudo themselves. With
     VPHONE_SUDO_PASSWORD set, ``sudo -A`` drives a 0700 askpass helper in /tmp
-    (returned as the third element so the caller can remove it); otherwise
-    ``sudo -n`` fails loudly rather than hanging on a TTY prompt.
+    that deletes itself once sudo reads it (its path is also returned so the
+    caller can remove it as a fallback); otherwise ``sudo -n`` fails loudly
+    rather than hanging on a TTY prompt.
     """
     pw = os.environ.get("VPHONE_SUDO_PASSWORD")
     if not pw:
         return ["sudo", "-n"], {}, None
     fd, path = tempfile.mkstemp(prefix="vphone-sudo-askpass.")
     safe = pw.replace("'", "'\\''")
-    os.write(fd, f"#!/bin/sh\necho '{safe}'\n".encode())
+    os.write(fd, f"#!/bin/sh\necho '{safe}'\nrm -f \"$0\"\n".encode())
     os.close(fd)
     os.chmod(path, 0o700)
     return ["sudo", "-A"], {"SUDO_ASKPASS": path}, path
@@ -771,8 +784,8 @@ def run_background(cmd_key: str, **params) -> dict:
     started in its own session (survives the MCP server) with stdout+stderr
     streamed to ``$VPHONE_ROOT/vphone-mcp/logs/<name-or-cmd>_launch_<epoch>.log``
     (a file-endpoint root, so the log is fetchable remotely). Entries declared
-    ``sudo: True`` run under sudo; the askpass helper is left in /tmp for sudo
-    to consume during startup.
+    ``sudo: True`` run under sudo; the askpass helper deletes itself once sudo
+    reads it.
     Returns ``{"pid", "log_path", "argv"}``.
     """
     entry = _entry(cmd_key)
@@ -781,6 +794,11 @@ def run_background(cmd_key: str, **params) -> dict:
     argv = _build_argv(entry, params)
     name = params.get("name")
     stem = str(name) if name else cmd_key
+    # A VM name is a single path component; keep it that way so a client-
+    # supplied name cannot escape the log directory via ../ or a separator.
+    stem = stem.replace("/", "_").replace("\\", "_").replace("..", "_")
+    if not stem or stem.startswith("."):
+        stem = cmd_key
     log_dir = files.log_dir()
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"{stem}_launch_{int(time.time())}.log"
@@ -822,8 +840,9 @@ def vm_bin() -> str:
 
 def escalator_status() -> dict:
     """Run ``vphone-escalator status`` (needs root) and return the result."""
+    esc = escalator_bin()  # resolve first — it can raise before any askpass is created
     prefix, senv, askpass = _sudo_prefix()
-    argv = prefix + [escalator_bin(), "status"]
+    argv = prefix + [esc, "status"]
     env = os.environ.copy()
     env.update(senv)
     try:
@@ -840,9 +859,10 @@ def escalator_allow(binaries: list[str] | None = None) -> dict:
     so the virtualization-entitled companion binary can launch. Idempotent —
     running it again refreshes the same entries.
     """
+    esc = escalator_bin()  # resolve first — it can raise before any askpass is created
     targets = binaries or [vm_bin()]
     prefix, senv, askpass = _sudo_prefix()
-    argv = prefix + [escalator_bin(), "allow", *targets]
+    argv = prefix + [esc, "allow", *targets]
     env = os.environ.copy()
     env.update(senv)
     try:

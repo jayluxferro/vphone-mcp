@@ -18,7 +18,7 @@ vphone-cli (Swift, vm/vphone.sock)
 iOS 26 VM
 ```
 
-Every socket action returns a compact grayscale screenshot (~20-30KB) inline in the response, so the LLM can see what happened without a separate call. The 21 CLI wrapper tools forward vphone-cli's stdout/stderr faithfully.
+Every socket action returns a compact grayscale screenshot (~20-30KB) inline in the response, so the LLM can see what happened without a separate call. The 20 CLI wrapper tools forward vphone-cli's stdout/stderr faithfully.
 
 ## Setup
 
@@ -221,7 +221,7 @@ doing after an install, since IPAs are large.
 | `recording_status()` | Whether a recording is running, and how many frames so far |
 | `get_file_url(path)` | URL for a server-side file, for remote clients (network transport only — see [File access](#file-access)) |
 | `create_upload_url(filename)` | URL a remote client can PUT a file (e.g. an IPA) to (network transport only) |
-| `install_ipa(ipa, name=None, headless=False, variant=None)` | Boot a VM with an IPA/TIPA installed once the guest channel connects |
+| `install_ipa(ipa, name=None, headless=False)` | Boot a VM with an IPA/TIPA installed once the guest channel connects |
 | `list_uploads()` | Staged uploads with size and age |
 | `delete_upload(filename)` | Remove one staged upload |
 
@@ -308,13 +308,13 @@ On all socket tools, `screen` controls the inline post-action screenshot (`scree
 | `vm_rename(name=None, new_name=None, library_root=None)` | Rename a VM (must be stopped) |
 | `vm_delete(name=None, force=False, library_root=None, confirm=False)` | Delete a VM; `confirm=True` required unless `force=True` |
 | `vm_clone(name=None, new_name=None, library_root=None)` | Clone a VM — the clone gets a fresh device identity, ideal for per-testcase VMs |
-| `vm_export(name=None, out=<required>, max_=False, include_ipsw=False, library_root=None)` | Export a VM to a `.vphone` archive |
+| `vm_export(name=None, out=<required>, max_compression=False, include_ipsw=False, library_root=None)` | Export a VM to a `.vphone` archive |
 | `vm_import(input=<required>, name=None, library_root=None)` | Import a `.vphone` archive as a new VM |
 | `vm_launch(name=None, dfu=False, headless=False, api_listen=None, kernel_debug_port=None, project_root=None, library_root=None, verbose=0)` | Launch a VM — blocking process, runs in background with a log file |
 | `vm_stop(name=None, timeout=None, library_root=None, confirm=False)` | Stop a running VM (SIGINT then SIGKILL) |
 | `vm_create(name=<required>, iphone_source=None, cloudos_source=None, gpu_driver_bundle=None, ipsw_cache=None, device=None, disk_size=None, preset=None, keep_artifacts=False, verbose=0, library_root=None, confirm=False)` | End-to-end create pipeline (prepare→patch→restore→CFW→boot); needs internet + sudo, long-running |
 | `fw_catalog(json=False)` | List firmware known to the cache |
-| `fw_prepare(name=None, iphone_source=None, cloudos_source=None, iphone_version=None, iphone_build=None, list_=False, project_root=None, library_root=None, verbose=0)` | Prepare firmware (downloads IPSW/cloudOS, staged in cache) |
+| `fw_prepare(name=None, iphone_source=None, cloudos_source=None, iphone_version=None, iphone_build=None, list_only=False, project_root=None, library_root=None, verbose=0)` | Prepare firmware (downloads IPSW/cloudOS, staged in cache) |
 | `fw_patch(name=None, preset=None, quiet=False, library_root=None)` | Patch the boot chain with a patch preset |
 | `restore(name=None, get_shsh=False, offline=False, udid=None, ecid=None, library_root=None, verbose=0, confirm=False)` | Restore a VM from prepared firmware |
 | `cfw_install(name=None, keep_artifacts=False, library_root=None, confirm=False)` | Install custom firmware via host mount; runs under sudo |
@@ -402,7 +402,7 @@ Every setting below has a matching CLI flag (`vphone-mcp --help`); flags win ove
 | `VPHONE_MCP_UPLOAD_TTL_HOURS` | — | How long staged uploads are kept (default 3; `0` keeps them until deleted) |
 | `VPHONE_MCP_RECORDING_TTL_HOURS` | — | Prune recordings older than this many hours when a new one starts (default `0` = keep until deleted) |
 | `VPHONE_MCP_FFMPEG_BIN` | — | ffmpeg binary override for poll mode (default: PATH lookup; without it recordings are zipped PNG frames) |
-| `VPHONE_MCP_APP_PROCESS` | — | vphone-cli's UI process name for menu driving (default `vphone-cli`) |
+| `VPHONE_MCP_APP_PROCESS` | — | VM app's UI process name for menu driving (default `vphone-vm`) |
 | `VPHONE_MCP_RECORD_MENU_KEYWORDS` | — | Comma-separated words matching the recording menu item (default `record`) |
 | `VPHONE_MCP_RECORDING_SEARCH_DIRS` | — | Where to look for a native recording's file (default: Movies, Desktop, Downloads, Pictures, `$VPHONE_ROOT`, the VM library, tmp) |
 

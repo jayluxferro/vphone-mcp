@@ -13,6 +13,7 @@ updates, and to keep the AMFI allowlist in shape:
 """
 
 import json
+import os
 import sys
 
 from . import cli
@@ -68,9 +69,15 @@ def _select(argv: list[str]) -> int:
         print(f"error: version {version!r} is not installed", file=sys.stderr)
         _print_versions()
         return 1
+    candidate = cli.bundle_bin(version)
+    if not (candidate.is_file() and os.access(candidate, os.X_OK)):
+        print(f"error: version {version!r} has no executable at {candidate}", file=sys.stderr)
+        return 1
     cli.select_version(version)
     print(f"selected vphone-cli {version}")
-    print("resolved binary:", cli.resolve_cli_bin())
+    print("binary:", candidate)
+    if os.environ.get("VPHONE_CLI_BIN") or os.environ.get("VPHONE_CLI_VERSION"):
+        print("note: $VPHONE_CLI_BIN / $VPHONE_CLI_VERSION override the selection")
     print("(the MCP server picks this up on its next start)")
     return 0
 
